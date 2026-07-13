@@ -17,6 +17,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::keychain;
+
 const DEFAULT_BYPASS_LIST: &str =
     "localhost,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,*.local";
 
@@ -54,11 +56,31 @@ fn default_true() -> bool {
 /// Read `proxyConfig` out of the project's `app-state.json`. Returns
 /// None if the file doesn't exist, can't be parsed, or has no proxy
 /// section — caller treats those identically to "no proxy".
-pub fn read_proxy_config_from_store(store_path: &Path) -> Option<ProxyConfig> {
-    let content = std::fs::read_to_string(store_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let proxy = json.get("proxyConfig")?;
-    serde_json::from_value(proxy.clone()).ok()
+pub fn read_proxy_config_from_store(store_path: &Path) -> Result<Option<ProxyConfig>, String> {
+    let content = match std::fs::read_to_string(store_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Unable to read proxy configuration".to_string()),
+    };
+    let mut json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(value) => value,
+        Err(_) => return Err("Invalid proxy configuration".to_string()),
+    };
+    let Some(proxy) = json.get_mut("proxyConfig") else {
+        return Ok(None);
+    };
+    let mut config: ProxyConfig = serde_json::from_value(proxy.clone())
+        .map_err(|_| "Invalid proxy config".to_string())?;
+    if config.enabled {
+        match keychain::load("proxyConfig.url")? {
+            Some(url) => config.url = url,
+            None => {}
+        }
+        if !is_valid_proxy_url(&config.url) || has_embedded_credentials(&config.url) {
+            return Err("Enabled proxy configuration is invalid or requires unsupported authentication".to_string());
+        }
+    }
+    Ok(Some(config))
 }
 
 /// Apply a proxy config by setting the env vars reqwest reads.
@@ -87,19 +109,15 @@ pub fn apply_proxy_env(config: &ProxyConfig) -> String {
     // through the now-removed proxy. The same applies to invalid
     // URLs and unsupported schemes (treat as disabled).
     let url = config.url.trim();
-    let invalid_scheme = !url.starts_with("http://") && !url.starts_with("https://");
+    let invalid_scheme = !is_valid_proxy_url(url) || has_embedded_credentials(url);
 
     if !config.enabled || url.is_empty() || invalid_scheme {
+        if config.enabled {
+            set_blocking_proxy_env(config.bypass_local);
+            return "blocked (invalid or authenticated proxy url)".to_string();
+        }
         clear_proxy_env();
-        return if !config.enabled {
-            "disabled".to_string()
-        } else if url.is_empty() {
-            "disabled (empty url)".to_string()
-        } else {
-            // Mask before logging — an invalid URL might still
-            // contain a password the user mis-typed.
-            format!("disabled (unsupported scheme: {})", redact_url(url))
-        };
+        return "disabled".to_string();
     }
 
     std::env::set_var("HTTP_PROXY", url);
@@ -116,6 +134,29 @@ pub fn apply_proxy_env(config: &ProxyConfig) -> String {
         redact_url(url),
         config.bypass_local
     )
+}
+
+fn is_valid_proxy_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn has_embedded_credentials(url: &str) -> bool {
+    let Some(scheme_end) = url.find("://") else {
+        return false;
+    };
+    let authority = &url[scheme_end + 3..];
+    let path_start = authority.find('/').unwrap_or(authority.len());
+    authority[..path_start].contains('@')
+}
+
+fn set_blocking_proxy_env(bypass_local: bool) {
+    std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9");
+    std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:9");
+    if bypass_local {
+        std::env::set_var("NO_PROXY", DEFAULT_BYPASS_LIST);
+    } else {
+        std::env::remove_var("NO_PROXY");
+    }
 }
 
 /// Strip embedded basic-auth credentials from a URL before logging.
@@ -256,26 +297,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_schemes() {
+    fn blocks_unsupported_schemes() {
         isolated(|| {
             apply_proxy_env(&ProxyConfig {
                 enabled: true,
                 url: "socks5://x:1".into(),
                 bypass_local: true,
             });
-            assert!(std::env::var("HTTP_PROXY").is_err());
+            assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:9");
         });
     }
 
     #[test]
-    fn rejects_empty_url() {
+    fn blocks_empty_url() {
         isolated(|| {
             apply_proxy_env(&ProxyConfig {
                 enabled: true,
                 url: "   ".into(),
                 bypass_local: true,
             });
-            assert!(std::env::var("HTTP_PROXY").is_err());
+            assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:9");
         });
     }
 
@@ -309,11 +350,9 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_scheme_after_enable_clears_env() {
-        // Same regression class for invalid-URL changes — switching
-        // the URL to something we won't apply (socks5://) must clear
-        // any previously-applied http(s) values, not silently keep
-        // them.
+    fn unsupported_scheme_after_enable_blocks_egress() {
+        // An invalid replacement must not preserve an old proxy or
+        // downgrade to direct outbound traffic.
         isolated(|| {
             apply_proxy_env(&ProxyConfig {
                 enabled: true,
@@ -325,7 +364,7 @@ mod tests {
                 url: "socks5://x:1".into(),
                 bypass_local: true,
             });
-            assert!(std::env::var("HTTP_PROXY").is_err());
+            assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:9");
         });
     }
 
@@ -370,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_proxy_env_summary_does_not_leak_password() {
+    fn authenticated_proxy_url_is_blocked_without_leaking_credentials() {
         isolated(|| {
             let summary = apply_proxy_env(&ProxyConfig {
                 enabled: true,
@@ -379,8 +418,8 @@ mod tests {
             });
             assert!(!summary.contains("secretpass"));
             assert!(!summary.contains("secretuser"));
-            assert!(summary.contains("***"));
-            assert!(summary.contains("proxy.corp:8080"));
+            assert_eq!(summary, "blocked (invalid or authenticated proxy url)");
+            assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:9");
         });
     }
 
@@ -418,7 +457,7 @@ mod tests {
     fn missing_proxyConfig_returns_none() {
         let dir = tempdir_for_test();
         let path = dir.join("missing.json");
-        assert!(read_proxy_config_from_store(&path).is_none());
+        assert!(read_proxy_config_from_store(&path).unwrap().is_none());
     }
 
     #[test]
@@ -430,7 +469,7 @@ mod tests {
             r#"{"proxyConfig": {"enabled": true, "url": "http://x:1", "bypassLocal": true}}"#,
         )
         .unwrap();
-        let cfg = read_proxy_config_from_store(&path).unwrap();
+        let cfg = read_proxy_config_from_store(&path).unwrap().unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.url, "http://x:1");
     }
@@ -440,7 +479,15 @@ mod tests {
         let dir = tempdir_for_test();
         let path = dir.join("app-state.json");
         std::fs::write(&path, r#"{"otherKey": "value"}"#).unwrap();
-        assert!(read_proxy_config_from_store(&path).is_none());
+        assert!(read_proxy_config_from_store(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_store_instead_of_downgrading_to_direct_egress() {
+        let dir = tempdir_for_test();
+        let path = dir.join("app-state.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_proxy_config_from_store(&path).is_err());
     }
 
     fn tempdir_for_test() -> std::path::PathBuf {

@@ -1,16 +1,59 @@
 import { load } from "@tauri-apps/plugin-store"
+import { invoke } from "@tauri-apps/api/core"
 import type { WikiProject } from "@/types/wiki"
 import type { ApiConfig, GeneralConfig, LlmConfig, SearchApiConfig, EmbeddingConfig, MineruConfig, MultimodalConfig, OutputLanguage, ProviderConfigs, ProxyConfig, ScheduledImportConfig, SourceWatchConfig } from "@/stores/wiki-store"
 import { normalizeSourceWatchConfig } from "@/lib/source-watch-config"
 import { normalizePath } from "@/lib/path-utils"
 import { DEFAULT_ZOOM_LEVEL, clampZoomLevel } from "@/stores/zoom-store"
+import { redactConfigSecrets, type StoredConfig } from "@/lib/keychain-config"
 
 const STORE_NAME = "app-state.json"
+const KEYCHAIN_MANAGED_KEYS = "keychainManagedKeys"
 const RECENT_PROJECTS_KEY = "recentProjects"
 const LAST_PROJECT_KEY = "lastProject"
 
 async function getStore() {
   return load(STORE_NAME, { autoSave: true, defaults: {} })
+}
+
+async function syncKeychainEntries(
+  store: Awaited<ReturnType<typeof getStore>>,
+  scope: string,
+  entries: Record<string, string>,
+): Promise<void> {
+  const managed = (await store.get<Record<string, string[]>>(KEYCHAIN_MANAGED_KEYS)) ?? {}
+  const previous = managed[scope] ?? []
+  const merged: Record<string, string> = {}
+  for (const key of previous) merged[key] = entries[key] ?? ""
+  Object.assign(merged, entries)
+  await invoke<void>("keychain_sync", { entries: merged })
+  await store.set(KEYCHAIN_MANAGED_KEYS, { ...managed, [scope]: Object.keys(entries) })
+}
+
+async function saveSecureConfig<T>(key: string, value: T): Promise<void> {
+  // A user save is the only flow allowed to revoke a Keychain entry by
+  // sending an explicit empty value.
+  const { config, secrets } = redactConfigSecrets({ [key]: value })
+  const store = await getStore()
+  await syncKeychainEntries(store, key, secrets)
+  await store.set(key, config[key])
+}
+
+async function loadSecureConfig<T>(key: string): Promise<T | null> {
+  const store = await getStore()
+  const value = await store.get<T>(key)
+  if (value === null || value === undefined) return null
+
+  // A load migrates legacy plaintext only. It must not interpret a redacted
+  // empty field as the user explicitly revoking an existing Keychain entry.
+  const { config, secrets } = redactConfigSecrets({ [key]: value }, false)
+  if (Object.keys(secrets).length > 0) {
+    await syncKeychainEntries(store, key, secrets)
+    await store.set(key, config[key])
+    await store.save()
+  }
+  const hydrated = await invoke<StoredConfig>("keychain_hydrate_config", { config })
+  return (hydrated[key] as T | undefined) ?? null
 }
 
 export async function getRecentProjects(): Promise<WikiProject[]> {
@@ -29,6 +72,11 @@ export async function saveLastProject(project: WikiProject): Promise<void> {
   const store = await getStore()
   await store.set(LAST_PROJECT_KEY, project)
   await addToRecentProjects(project)
+  await store.save()
+  // The Rust API caches app-state for five seconds. Explicitly clear that
+  // cache after the persisted project pointer changes so `current` cannot
+  // resolve to the project that was open immediately before this one.
+  await invoke<string>("api_server_reload_config")
 }
 
 export async function addToRecentProjects(
@@ -46,23 +94,19 @@ const PROVIDER_CONFIGS_KEY = "providerConfigs"
 const ACTIVE_PRESET_KEY = "activePresetId"
 
 export async function saveLlmConfig(config: LlmConfig): Promise<void> {
-  const store = await getStore()
-  await store.set(LLM_CONFIG_KEY, config)
+  await saveSecureConfig(LLM_CONFIG_KEY, config)
 }
 
 export async function loadLlmConfig(): Promise<LlmConfig | null> {
-  const store = await getStore()
-  return (await store.get<LlmConfig>(LLM_CONFIG_KEY)) ?? null
+  return loadSecureConfig<LlmConfig>(LLM_CONFIG_KEY)
 }
 
 export async function saveProviderConfigs(configs: ProviderConfigs): Promise<void> {
-  const store = await getStore()
-  await store.set(PROVIDER_CONFIGS_KEY, configs)
+  await saveSecureConfig(PROVIDER_CONFIGS_KEY, configs)
 }
 
 export async function loadProviderConfigs(): Promise<ProviderConfigs | null> {
-  const store = await getStore()
-  return (await store.get<ProviderConfigs>(PROVIDER_CONFIGS_KEY)) ?? null
+  return loadSecureConfig<ProviderConfigs>(PROVIDER_CONFIGS_KEY)
 }
 
 export async function saveActivePresetId(id: string | null): Promise<void> {
@@ -78,37 +122,31 @@ export async function loadActivePresetId(): Promise<string | null> {
 const SEARCH_API_KEY = "searchApiConfig"
 
 export async function saveSearchApiConfig(config: SearchApiConfig): Promise<void> {
-  const store = await getStore()
-  await store.set(SEARCH_API_KEY, config)
+  await saveSecureConfig(SEARCH_API_KEY, config)
 }
 
 export async function loadSearchApiConfig(): Promise<SearchApiConfig | null> {
-  const store = await getStore()
-  return (await store.get<SearchApiConfig>(SEARCH_API_KEY)) ?? null
+  return loadSecureConfig<SearchApiConfig>(SEARCH_API_KEY)
 }
 
 const EMBEDDING_KEY = "embeddingConfig"
 
 export async function saveEmbeddingConfig(config: EmbeddingConfig): Promise<void> {
-  const store = await getStore()
-  await store.set(EMBEDDING_KEY, config)
+  await saveSecureConfig(EMBEDDING_KEY, config)
 }
 
 export async function loadEmbeddingConfig(): Promise<EmbeddingConfig | null> {
-  const store = await getStore()
-  return (await store.get<EmbeddingConfig>(EMBEDDING_KEY)) ?? null
+  return loadSecureConfig<EmbeddingConfig>(EMBEDDING_KEY)
 }
 
 const MULTIMODAL_KEY = "multimodalConfig"
 
 export async function saveMultimodalConfig(config: MultimodalConfig): Promise<void> {
-  const store = await getStore()
-  await store.set(MULTIMODAL_KEY, config)
+  await saveSecureConfig(MULTIMODAL_KEY, config)
 }
 
 export async function loadMultimodalConfig(): Promise<MultimodalConfig | null> {
-  const store = await getStore()
-  return (await store.get<MultimodalConfig>(MULTIMODAL_KEY)) ?? null
+  return loadSecureConfig<MultimodalConfig>(MULTIMODAL_KEY)
 }
 
 const MINERU_KEY = "mineruConfig"
@@ -133,13 +171,11 @@ export const __projectStoreTest = {
 }
 
 export async function saveMineruConfig(config: MineruConfig): Promise<void> {
-  const store = await getStore()
-  await store.set(MINERU_KEY, normalizeMineruConfig(config))
+  await saveSecureConfig(MINERU_KEY, normalizeMineruConfig(config))
 }
 
 export async function loadMineruConfig(): Promise<MineruConfig | null> {
-  const store = await getStore()
-  const config = await store.get<MineruConfig>(MINERU_KEY)
+  const config = await loadSecureConfig<MineruConfig>(MINERU_KEY)
   return config ? normalizeMineruConfig(config) : null
 }
 
@@ -150,8 +186,8 @@ export async function loadMineruConfig(): Promise<MineruConfig | null> {
 const PROXY_CONFIG_KEY = "proxyConfig"
 
 export async function saveProxyConfig(config: ProxyConfig): Promise<void> {
+  await saveSecureConfig(PROXY_CONFIG_KEY, config)
   const store = await getStore()
-  await store.set(PROXY_CONFIG_KEY, config)
   // Force-flush to disk. The store is opened with `autoSave: true`,
   // which is a 100ms debounce — not an immediate write. For most
   // settings that's fine, but the proxy config is on the startup
@@ -164,8 +200,7 @@ export async function saveProxyConfig(config: ProxyConfig): Promise<void> {
 }
 
 export async function loadProxyConfig(): Promise<ProxyConfig | null> {
-  const store = await getStore()
-  return (await store.get<ProxyConfig>(PROXY_CONFIG_KEY)) ?? null
+  return loadSecureConfig<ProxyConfig>(PROXY_CONFIG_KEY)
 }
 
 // Local API server config. KEY MUST stay `apiConfig` — the Rust
@@ -175,8 +210,8 @@ export async function loadProxyConfig(): Promise<ProxyConfig | null> {
 const API_CONFIG_KEY = "apiConfig"
 
 export async function saveApiConfig(config: ApiConfig): Promise<void> {
+  await saveSecureConfig(API_CONFIG_KEY, config)
   const store = await getStore()
-  await store.set(API_CONFIG_KEY, config)
   // Force-flush. The 100ms debounce default is fine for cosmetic
   // settings, but the API token is on a security hot path — a user
   // generates one, hits Save, then immediately curls the API from
@@ -186,8 +221,7 @@ export async function saveApiConfig(config: ApiConfig): Promise<void> {
 }
 
 export async function loadApiConfig(): Promise<ApiConfig | null> {
-  const store = await getStore()
-  return (await store.get<ApiConfig>(API_CONFIG_KEY)) ?? null
+  return loadSecureConfig<ApiConfig>(API_CONFIG_KEY)
 }
 
 const GENERAL_CONFIG_KEY = "generalConfig"
@@ -265,6 +299,8 @@ export async function removeFromRecentProjects(
   const last = await store.get<WikiProject>(LAST_PROJECT_KEY)
   if (last && last.path === path) {
     await store.delete(LAST_PROJECT_KEY)
+    await store.save()
+    await invoke<string>("api_server_reload_config")
   }
 }
 

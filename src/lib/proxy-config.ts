@@ -18,10 +18,9 @@
 export interface ProxyConfig {
   enabled: boolean
   /**
-   * Full proxy URL with scheme, e.g. `http://127.0.0.1:7890`.
-   * Embedded basic auth (`http://user:pass@host:port`) is fine —
-   * stored verbatim alongside other API keys (no separate secret
-   * store).
+   * Proxy URL with scheme, e.g. `http://127.0.0.1:7890`.
+   * Authenticated proxy URLs are intentionally unsupported: credentials
+   * in process-wide environment variables leak into child processes.
    */
   url: string
   /**
@@ -77,6 +76,9 @@ export function validateProxyUrl(url: string): ValidateResult {
   }
   if (!parsed.hostname) {
     return { ok: false, error: "URL is missing a host" }
+  }
+  if (parsed.username || parsed.password) {
+    return { ok: false, error: "Authenticated proxy URLs are not supported" }
   }
   return { ok: true }
 }

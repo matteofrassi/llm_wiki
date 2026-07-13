@@ -1,8 +1,8 @@
 mod agent;
 mod api_server;
-mod clip_server;
 mod commands;
 mod cors;
+mod keychain;
 mod panic_guard;
 mod proxy;
 mod server_bind;
@@ -34,14 +34,6 @@ struct AgentRuntimeConfig {
     llm: Option<agent::provider::LlmConfig>,
     web_search: Option<agent::tools::WebSearchConfig>,
     anytxt: Option<agent::tools::AnyTxtConfig>,
-}
-
-#[tauri::command]
-fn clip_server_status() -> String {
-    run_guarded("clip_server_status", || {
-        Ok(clip_server::get_daemon_status().to_string())
-    })
-    .unwrap_or_else(|e| format!("error: {e}"))
 }
 
 #[tauri::command]
@@ -340,7 +332,7 @@ fn resolve_agent_project(
 }
 
 fn load_agent_projects(app: &tauri::AppHandle) -> Vec<AgentProjectEntry> {
-    let current = normalize_path(&clip_server::current_project_path());
+    let current = current_project_path(app);
     let mut projects = Vec::new();
     if let Some(parsed) = load_agent_app_state(app) {
         if let Some(registry) = parsed.get("projectRegistry").and_then(Value::as_object) {
@@ -398,10 +390,18 @@ fn load_agent_projects(app: &tauri::AppHandle) -> Vec<AgentProjectEntry> {
     projects
 }
 
+fn current_project_path(app: &tauri::AppHandle) -> String {
+    load_agent_app_state(app)
+        .and_then(|value| value.get("lastProject")?.get("path")?.as_str().map(normalize_path))
+        .unwrap_or_default()
+}
+
 fn load_agent_app_state(app: &tauri::AppHandle) -> Option<Value> {
     let path = app.path().app_data_dir().ok()?.join("app-state.json");
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    let mut value = serde_json::from_str(&raw).ok()?;
+    let _ = keychain::hydrate_config(&mut value);
+    Some(value)
 }
 
 fn load_agent_runtime_config(app: &tauri::AppHandle) -> AgentRuntimeConfig {
@@ -577,11 +577,22 @@ pub fn run() {
             if let Ok(dir) = app.path().app_data_dir() {
                 let store_path = dir.join("app-state.json");
                 eprintln!("[proxy] reading from {}", store_path.display());
-                if let Some(cfg) = proxy::read_proxy_config_from_store(&store_path) {
-                    let summary = proxy::apply_proxy_env(&cfg);
-                    eprintln!("[proxy] {summary}");
-                } else {
-                    eprintln!("[proxy] no proxyConfig in store, requests go direct");
+                match proxy::read_proxy_config_from_store(&store_path) {
+                    Ok(Some(cfg)) => {
+                        let summary = proxy::apply_proxy_env(&cfg);
+                        eprintln!("[proxy] {summary}");
+                    }
+                    Ok(None) => eprintln!("[proxy] no proxyConfig in store, requests go direct"),
+                    Err(_) => {
+                        // A configured proxy whose password cannot be read from
+                        // Keychain must never silently downgrade to direct egress.
+                        let summary = proxy::apply_proxy_env(&proxy::ProxyConfig {
+                            enabled: true,
+                            url: "http://127.0.0.1:9".to_string(),
+                            bypass_local: false,
+                        });
+                        eprintln!("[proxy] Keychain unavailable; outbound traffic blocked ({summary})");
+                    }
                 }
             } else {
                 eprintln!("[proxy] could not resolve app_data_dir");
@@ -598,7 +609,6 @@ pub fn run() {
             app.manage(TrayAvailabilityState(Mutex::new(false)));
             // Start the API before optional desktop integrations so the
             // backend is reachable if tray setup or another integration fails.
-            clip_server::start_clip_server(app.handle().clone());
             api_server::start_api_server(app.handle().clone());
             let tray_available = match tray::create_tray(app.handle()) {
                 Ok(()) => true,
@@ -647,9 +657,10 @@ pub fn run() {
             commands::search::get_page_links,
             commands::external_search::web_search,
             commands::external_search::anytxt_search,
-            clip_server_status,
             api_server_status,
             api_server_reload_config,
+            keychain::keychain_sync,
+            keychain::keychain_hydrate_config,
             agent_start_turn,
             agent_start_turn_stream,
             agent_cancel_turn,

@@ -18,17 +18,6 @@ jobs:
           - platform: macos-latest
             args: '--target aarch64-apple-darwin'
             rust_target: aarch64-apple-darwin
-          - platform: ubuntu-22.04
-            args: ''
-            rust_target: ''
-          # GitHub-hosted ARM Linux runner (free for public repos
-          # since 2024). Native build — no cross-compile of webkit2gtk.
-          - platform: ubuntu-22.04-arm
-            args: ''
-            rust_target: ''
-          - platform: windows-latest
-            args: ''
-            rust_target: ''
 
     runs-on: ${{ matrix.platform }}
     env:
@@ -168,37 +157,3 @@ jobs:
             dist-portable/*.zip
           if-no-files-found: warn
           retention-days: 14
-
-  package-extension:
-    name: Package browser extension
-    needs: build
-    # Browser extension is only published as part of an actual
-    # tagged release; manual builds don't need it.
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Sync extension manifest version and zip
-        run: |
-          # Pull version from package.json so we have a single source of
-          # truth. Chrome's manifest requires numeric-only version
-          # (e.g. 0.3.5), which matches the repo's semver convention.
-          APP_VERSION=$(node -p "require('./package.json').version")
-          node -e "
-            const fs = require('fs');
-            const p = 'extension/manifest.json';
-            const m = JSON.parse(fs.readFileSync(p, 'utf-8'));
-            m.version = '${APP_VERSION}';
-            fs.writeFileSync(p, JSON.stringify(m, null, 2) + '\n');
-          "
-          mkdir -p dist-extension
-          (cd extension && zip -r "../dist-extension/llm-wiki-extension-${APP_VERSION}.zip" . -x "*.DS_Store")
-          ls -la dist-extension
-
-      - name: Attach extension zip to release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ github.ref_name }}" dist-extension/*.zip --clobber

@@ -46,7 +46,6 @@
 - **Generated Outputs Preview** — Agent-created Markdown, HTML, images, and other workspace files appear as outputs with preview and quick folder access
 - **Mermaid Diagram Rendering** — render Mermaid code blocks directly in chat and preview, with compact syntax-error cards instead of raw parser output
 - **Async Review System** — LLM flags items for human judgment, predefined actions, pre-generated search queries
-- **Chrome Web Clipper** — one-click web page capture with auto-ingest into knowledge base
 - **Local HTTP API + MCP Server + AI Agent Skill** — built-in `127.0.0.1:19828` JSON API and bundled MCP server for hybrid search, file read, graph traversal, and source rescan; ready-made [agent skill](https://github.com/nashsu/llm_wiki_skill) installs into Claude Code / Codex with one command (`npx skills add …`)
 
 ## What is this?
@@ -298,23 +297,7 @@ Not in the original. When the LLM identifies knowledge gaps:
 - **Task queue** with 3 concurrent tasks
 - **Research Panel** — dedicated sidebar panel with dynamic height, real-time streaming progress
 
-### 14. Browser Extension (Web Clipper)
-
-<p align="center">
-  <img src="assets/4-chrome_extension_webclipper.jpg" width="100%" alt="Chrome Extension Web Clipper">
-</p>
-
-The original mentions Obsidian Web Clipper. We built a **dedicated Chrome Extension** (Manifest V3):
-
-- **Mozilla Readability.js** for accurate article extraction (strips ads, nav, sidebars)
-- **Turndown.js** for HTML → Markdown conversion with table support
-- **Project picker** — choose which wiki to clip into (supports multi-project)
-- **Local HTTP API** (port 19827, tiny_http) — Extension ↔ App communication
-- **Auto-ingest** — clipped content automatically triggers the two-step ingest pipeline
-- **Clip watcher** — polls every 3 seconds for new clips, processes automatically
-- **Offline preview** — shows extracted content even when app is not running
-
-### 15. Multi-format Document Support
+### 14. Multi-format Document Support
 
 The original focuses on text/markdown. We support structured extraction preserving document semantics:
 
@@ -326,11 +309,10 @@ The original focuses on text/markdown. We support structured extraction preservi
 | XLSX/XLS/ODS | calamine — proper cell types, multi-sheet support, Markdown tables |
 | Images | Native preview (png, jpg, gif, webp, svg, etc.) |
 | Video/Audio | Built-in player |
-| Web clips | Readability.js + Turndown.js → clean Markdown |
 
 > MinerU is optional. When enabled, PDF files are uploaded to MinerU cloud for parsing; keep the built-in parser for sensitive documents. If MinerU fails, LLM Wiki falls back to the built-in parser. MinerU usage is subject to its file size, page count, and quota limits.
 
-### 16. File Deletion with Cascade Cleanup
+### 15. File Deletion with Cascade Cleanup
 
 The original has no deletion mechanism. We added **intelligent cascade deletion**:
 
@@ -406,13 +388,6 @@ npm install
 npm run tauri dev      # Development
 npm run tauri build    # Production build
 ```
-
-### Chrome Extension
-
-1. Open `chrome://extensions`
-2. Enable "Developer mode"
-3. Click "Load unpacked"
-4. Select the `extension/` directory
 
 ## Quick Start
 

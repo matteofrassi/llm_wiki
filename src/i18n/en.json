@@ -752,7 +752,6 @@
         "title": "About",
         "description": "Build info and runtime status.",
         "version": "Version",
-        "clipServer": "Clip Server",
         "apiServer": "API Server",
         "apiDisabled": "disabled",
         "apiOpen": "running (no auth)",
