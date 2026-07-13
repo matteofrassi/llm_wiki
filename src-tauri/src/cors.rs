@@ -9,9 +9,7 @@ pub fn request_origin(request: &tiny_http::Request) -> Option<String> {
 }
 
 pub fn is_allowed_browser_origin(origin: &str) -> bool {
-    origin.starts_with("chrome-extension://")
-        || origin.starts_with("moz-extension://")
-        || origin == "http://localhost"
+    origin == "http://localhost"
         || origin.starts_with("http://localhost:")
         || origin == "http://127.0.0.1"
         || origin.starts_with("http://127.0.0.1:")
@@ -50,10 +48,7 @@ mod tests {
     #[test]
     fn allowed_browser_origins_are_narrowly_scoped() {
         for origin in [
-            "chrome-extension://abc",
-            "moz-extension://abc",
             "http://localhost",
-            "http://localhost:19827",
             "http://127.0.0.1:5500",
             "http://[::1]:3000",
             "tauri://localhost",
@@ -65,6 +60,8 @@ mod tests {
 
         for origin in [
             "",
+            "chrome-extension://abc",
+            "moz-extension://abc",
             "HTTP://LOCALHOST",
             "http://localhost.evil.com",
             "http://127.0.0.1.evil.com",
@@ -78,10 +75,10 @@ mod tests {
 
     #[test]
     fn cors_headers_reflect_allowed_origin_only() {
-        let allowed = local_cors_headers(Some("chrome-extension://abc"), "Content-Type");
+        let allowed = local_cors_headers(Some("tauri://localhost"), "Content-Type");
         assert_eq!(
             header_value(&allowed, "Access-Control-Allow-Origin").as_deref(),
-            Some("chrome-extension://abc")
+            Some("tauri://localhost")
         );
         assert_eq!(
             header_value(&allowed, "Access-Control-Allow-Private-Network").as_deref(),

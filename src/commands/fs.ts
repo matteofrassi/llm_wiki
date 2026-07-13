@@ -240,10 +240,6 @@ export async function openPathInProject(projectPath: string, targetPath: string)
   return invoke<void>("open_path_in_project", { projectPath, targetPath })
 }
 
-export async function clipServerStatus(): Promise<string> {
-  return invoke<string>("clip_server_status")
-}
-
 export async function apiServerStatus(): Promise<string> {
   return invoke<string>("api_server_status")
 }

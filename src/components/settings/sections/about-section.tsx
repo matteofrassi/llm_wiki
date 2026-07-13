@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from "react"
 import { Download, RefreshCw, CheckCircle2, Sparkles } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { openUrl } from "@tauri-apps/plugin-opener"
-import { apiServerStatus, clipServerStatus } from "@/commands/fs"
+import { apiServerStatus } from "@/commands/fs"
 import { Button } from "@/components/ui/button"
 import { API_SERVER_HEALTH_URL, API_SERVER_PORT } from "@/lib/api-server-constants"
 import { useUpdateStore, hasAvailableUpdate } from "@/stores/update-store"
@@ -17,20 +17,12 @@ interface ApiHealth {
 
 export function AboutSection() {
   const { t } = useTranslation()
-  const [clipStatus, setClipStatus] = useState<string>("...")
   const [apiStatus, setApiStatus] = useState<string>("...")
   const [apiHealth, setApiHealth] = useState<ApiHealth | null>(null)
   const updateStore = useUpdateStore()
 
   useEffect(() => {
     let alive = true
-    clipServerStatus()
-      .then((s) => {
-        if (alive) setClipStatus(s)
-      })
-      .catch(() => {
-        if (alive) setClipStatus("unknown")
-      })
     apiServerStatus()
       .then((s) => {
         if (alive) setApiStatus(s)
@@ -105,7 +97,6 @@ export function AboutSection() {
   })()
   const rows: Array<{ label: string; value: string; mono?: boolean }> = [
     { label: t("settings.sections.about.version"), value: `v${__APP_VERSION__}`, mono: true },
-    { label: t("settings.sections.about.clipServer"), value: `${clipStatus}  @  127.0.0.1:19827`, mono: true },
     { label: t("settings.sections.about.apiServer"), value: `${apiStatusDisplay}  @  127.0.0.1:${API_SERVER_PORT}`, mono: true },
   ]
 

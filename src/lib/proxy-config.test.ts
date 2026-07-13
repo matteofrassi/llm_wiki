@@ -17,8 +17,8 @@ describe("validateProxyUrl", () => {
     expect(validateProxyUrl("https://proxy.corp:443")).toEqual({ ok: true })
   })
 
-  it("accepts URLs with embedded auth", () => {
-    expect(validateProxyUrl("http://user:pass@127.0.0.1:7890")).toEqual({ ok: true })
+  it("rejects URLs with embedded auth", () => {
+    expect(validateProxyUrl("http://user:pass@127.0.0.1:7890")).toMatchObject({ ok: false })
   })
 
   it("rejects URLs with no scheme", () => {

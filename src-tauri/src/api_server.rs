@@ -15,7 +15,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::cors::{local_cors_headers, request_origin};
-use crate::{agent, clip_server, commands, server_bind};
+use crate::{agent, commands, keychain, server_bind};
 
 const PORT: u16 = 19828;
 const API_PREFIX: &str = "/api/v1";
@@ -577,7 +577,11 @@ fn load_app_state(app: &AppHandle) -> Option<Value> {
     let path = app.path().app_data_dir().ok()?.join("app-state.json");
     let loaded = fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .map(|mut value| {
+            let _ = keychain::hydrate_config(&mut value);
+            value
+        });
     let value = loaded.or(previous);
 
     if let Ok(mut cache) = lock.lock() {
@@ -608,7 +612,9 @@ fn handle_projects(app: &AppHandle) -> ApiResponse {
 }
 
 fn load_projects(app: &AppHandle) -> Vec<ProjectEntry> {
-    let current = normalize_path(&clip_server::current_project_path());
+    let current = load_app_state(app)
+        .and_then(|value| value.get("lastProject")?.get("path")?.as_str().map(normalize_path))
+        .unwrap_or_default();
     let mut by_path: BTreeMap<String, ProjectEntry> = BTreeMap::new();
 
     if let Some(parsed) = load_app_state(app) {
@@ -658,20 +664,6 @@ fn load_projects(app: &AppHandle) -> Vec<ProjectEntry> {
                 });
             }
         }
-    }
-
-    for (name, path) in clip_server::all_projects() {
-        let path = normalize_path(&path);
-        by_path.entry(path.clone()).or_insert_with(|| ProjectEntry {
-            id: read_project_id(&path).unwrap_or_else(|| path.clone()),
-            name: if name.is_empty() {
-                project_name_from_path(&path)
-            } else {
-                name
-            },
-            current: path == current,
-            path,
-        });
     }
 
     if !current.is_empty() {
