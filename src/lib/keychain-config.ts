@@ -5,6 +5,10 @@ export interface RedactedConfig {
   secrets: Record<string, string>
 }
 
+export function plaintextSecretPaths(input: StoredConfig): string[] {
+  return Object.keys(redactConfigSecrets(input, false).secrets)
+}
+
 const STATIC_SECRET_PATHS = [
   "llmConfig.apiKey",
   "searchApiConfig.apiKey",
