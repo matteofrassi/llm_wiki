@@ -5,7 +5,7 @@ import type { ApiConfig, GeneralConfig, LlmConfig, SearchApiConfig, EmbeddingCon
 import { normalizeSourceWatchConfig } from "@/lib/source-watch-config"
 import { normalizePath } from "@/lib/path-utils"
 import { DEFAULT_ZOOM_LEVEL, clampZoomLevel } from "@/stores/zoom-store"
-import { redactConfigSecrets, type StoredConfig } from "@/lib/keychain-config"
+import { plaintextSecretPaths, redactConfigSecrets, type StoredConfig } from "@/lib/keychain-config"
 
 const STORE_NAME = "app-state.json"
 const KEYCHAIN_MANAGED_KEYS = "keychainManagedKeys"
@@ -208,6 +208,26 @@ export async function loadProxyConfig(): Promise<ProxyConfig | null> {
 // `app-state.json` on every request (5s cache). Rename one side and
 // the API silently goes back to "no token configured = 401 forever".
 const API_CONFIG_KEY = "apiConfig"
+const SECURE_CONFIG_KEYS = [
+  LLM_CONFIG_KEY,
+  PROVIDER_CONFIGS_KEY,
+  SEARCH_API_KEY,
+  EMBEDDING_KEY,
+  MULTIMODAL_KEY,
+  MINERU_KEY,
+  PROXY_CONFIG_KEY,
+  API_CONFIG_KEY,
+]
+
+export async function findPersistedPlaintextSecrets(): Promise<string[]> {
+  const store = await getStore()
+  const config: StoredConfig = {}
+  for (const key of SECURE_CONFIG_KEYS) {
+    const value = await store.get<unknown>(key)
+    if (value !== null && value !== undefined) config[key] = value
+  }
+  return plaintextSecretPaths(config)
+}
 
 export async function saveApiConfig(config: ApiConfig): Promise<void> {
   await saveSecureConfig(API_CONFIG_KEY, config)

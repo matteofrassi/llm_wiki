@@ -9,7 +9,7 @@ import { useLintStore } from "@/stores/lint-store"
 import { useChatStore } from "@/stores/chat-store"
 import { BASE_FONT_SIZE_PX, useZoomStore } from "@/stores/zoom-store"
 import { openProject } from "@/commands/fs"
-import { getLastProject, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMineruConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadActivePresetId, loadProxyConfig, loadScheduledImportConfig, saveScheduledImportConfig, loadSourceWatchConfig, loadApiConfig, loadGeneralConfig, loadZoomLevel } from "@/lib/project-store"
+import { getLastProject, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMineruConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadActivePresetId, loadProxyConfig, loadScheduledImportConfig, saveScheduledImportConfig, loadSourceWatchConfig, loadApiConfig, loadGeneralConfig, loadZoomLevel, findPersistedPlaintextSecrets } from "@/lib/project-store"
 import { loadReviewItems, loadLintItems, loadChatHistory, loadChatPreferences } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
 import { AppLayout } from "@/components/layout/app-layout"
@@ -280,6 +280,13 @@ function App() {
         const savedZoom = await loadZoomLevel()
         applyDocumentZoom(savedZoom)
         useZoomStore.getState().setLevel(savedZoom)
+
+        const plaintextPaths = await findPersistedPlaintextSecrets()
+        if (plaintextPaths.length > 0) {
+          console.error("[security] plaintext credentials detected; automatic project opening blocked")
+          window.alert("Configurazione sensibile da verificare. L'app non aprira automaticamente alcun progetto.")
+          return
+        }
 
         const savedConfig = await loadLlmConfig()
         if (savedConfig) {

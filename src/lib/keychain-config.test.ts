@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { redactConfigSecrets, restoreConfigSecrets } from "./keychain-config"
+import { plaintextSecretPaths, redactConfigSecrets, restoreConfigSecrets } from "./keychain-config"
 
 describe("keychain-config", () => {
   it("moves every supported credential out of persisted configuration", () => {
@@ -62,5 +62,17 @@ describe("keychain-config", () => {
     )
 
     expect(secrets).toEqual({})
+  })
+
+  it("reports plaintext paths without returning their values", () => {
+    expect(plaintextSecretPaths({
+      llmConfig: { apiKey: "stored-value" },
+      providerConfigs: { custom: { apiKey: "stored-value" } },
+      embeddingConfig: { extraHeaders: { Authorization: "stored-value" } },
+    })).toEqual([
+      "llmConfig.apiKey",
+      "providerConfigs.custom.apiKey",
+      "embeddingConfig.extraHeaders",
+    ])
   })
 })
