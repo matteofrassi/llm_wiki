@@ -23,15 +23,16 @@ import {
   isSafeIngestPath,
   stampGeneratedFrontmatterDates,
   stampGeneratedLogDate,
+  buildAnalysisPrompt,
   buildGenerationPrompt,
   sourceSummaryMediaRefsForExternalMarkdown,
-  aggregatePathsNeedingRepair,
-  filterAggregateRepairOutput,
+  buildDeterministicIngestLog,
   rewriteIngestPathFromTitleForTargetLanguage,
   canonicalizeSourcesField,
   isAppManagedAggregatePath,
   updateBoundedRecentIndexSection,
   updateCategorizedIndexSections,
+  filterTruncatedFileRepairOutput,
 } from "./ingest"
 
 // ── Happy paths ─────────────────────────────────────────────────────
@@ -113,43 +114,16 @@ describe("source summary media refs", () => {
   })
 })
 
-describe("aggregate repair targeting", () => {
-  it("repairs only the append-only log and leaves deterministic aggregates to the app", () => {
-    expect(aggregatePathsNeedingRepair(
-      ["wiki/index.md", "wiki/log.md"],
-      ['FILE block "wiki/overview.md" was not closed before end of stream — likely truncation.'],
-    )).toEqual([])
-
-    expect(aggregatePathsNeedingRepair(["wiki/index.md"], [])).toEqual(["wiki/log.md"])
-
-    expect(aggregatePathsNeedingRepair(
-      ["wiki/index.md", "wiki/overview.md", "wiki/log.md"],
-      [],
-    )).toEqual([])
+describe("deterministic ingest log", () => {
+  it("builds a deterministic append-only log entry without another LLM call", () => {
+    expect(buildDeterministicIngestLog("", "raw/sources/a.pdf", "2026-07-20")).toBe(
+      "# Wiki Log\n\n## 2026-07-20 ingest | a\n\n- Processed source: `raw/sources/a.pdf`.\n",
+    )
+    expect(buildDeterministicIngestLog("# Wiki Log\n", "raw/sources/b.pdf", "2026-07-20")).toBe(
+      "# Wiki Log\n\n## 2026-07-20 ingest | b\n\n- Processed source: `raw/sources/b.pdf`.\n",
+    )
   })
 
-  it("filters aggregate repair output to the requested aggregate paths only", () => {
-    const raw = [
-      "---FILE: wiki/overview.md---",
-      "# Overview",
-      "---END FILE---",
-      "",
-      "---FILE: wiki/sources/should-not-touch.md---",
-      "# Stray Source Summary",
-      "---END FILE---",
-      "",
-      "---FILE: wiki/entities/stray.md---",
-      "# Stray Entity",
-      "---END FILE---",
-    ].join("\n")
-
-    const filtered = filterAggregateRepairOutput(raw, ["wiki/overview.md"])
-
-    expect(filtered.text).toContain("---FILE: wiki/overview.md---")
-    expect(filtered.text).not.toContain("should-not-touch")
-    expect(filtered.text).not.toContain("wiki/entities/stray.md")
-    expect(filtered.warnings.join("\n")).toContain("Dropped 2 non-aggregate")
-  })
 })
 
 // ── H1: CRLF normalization ─────────────────────────────────────────
@@ -199,7 +173,7 @@ describe("parseFileBlocks — H2: truncated streams (surface, don't hide)", () =
       "---FILE: wiki/concepts/moe.md---",
       "# Mixture of Exp", // stream cut here
     ].join("\n")
-    const { blocks, warnings } = parseFileBlocks(text)
+    const { blocks, warnings, truncatedPaths } = parseFileBlocks(text)
     // Completed block makes it through.
     expect(blocks).toHaveLength(1)
     expect(blocks[0].path).toBe("wiki/entities/qwen.md")
@@ -207,6 +181,7 @@ describe("parseFileBlocks — H2: truncated streams (surface, don't hide)", () =
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toMatch(/wiki\/concepts\/moe\.md/)
     expect(warnings[0]).toMatch(/not closed/i)
+    expect(truncatedPaths).toEqual(["wiki/concepts/moe.md"])
   })
 
   it("warns when the only block is unclosed", () => {
@@ -215,6 +190,34 @@ describe("parseFileBlocks — H2: truncated streams (surface, don't hide)", () =
     expect(blocks).toHaveLength(0)
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toMatch(/rope\.md/)
+  })
+})
+
+describe("filterTruncatedFileRepairOutput", () => {
+  it("keeps one requested block and drops duplicate and unrequested blocks", () => {
+    const requested = "wiki/concepts/recovered.md"
+    const result = filterTruncatedFileRepairOutput([
+      `---FILE: ${requested}---`,
+      "# First complete repair",
+      "---END FILE---",
+      `---FILE: ${requested}---`,
+      "# Duplicate repair",
+      "---END FILE---",
+      "---FILE: wiki/concepts/unrequested.md---",
+      "# Unrequested",
+      "---END FILE---",
+    ].join("\n"), [requested])
+
+    expect(result.paths).toEqual([requested])
+    expect(result.text).toContain("# First complete repair")
+    expect(result.text).not.toContain("# Duplicate repair")
+    expect(result.text).not.toContain("# Unrequested")
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/duplicate FILE block/),
+        expect.stringMatching(/unrequested FILE block/),
+      ]),
+    )
   })
 })
 
@@ -595,6 +598,16 @@ describe("generated ingest dates", () => {
     expect(prompt).toContain("Use this exact date")
     expect(prompt).not.toContain("created: 2026-04-29")
   })
+
+  it("instructs the model to preserve structured source data verbatim", () => {
+    const prompt = buildGenerationPrompt("", "", "", "schema.sql")
+    const analysisPrompt = buildAnalysisPrompt("", "", "CREATE TABLE users (id BIGINT PRIMARY KEY);")
+
+    expect(prompt).toContain("Preserve structured source data verbatim")
+    expect(prompt).toContain("DDL")
+    expect(analysisPrompt).toContain("Preserve structured source data verbatim")
+    expect(analysisPrompt).toContain("constraints, keys, or indexes")
+  })
 })
 
 describe("rewriteIngestPathFromTitleForTargetLanguage", () => {
@@ -618,6 +631,76 @@ describe("rewriteIngestPathFromTitleForTargetLanguage", () => {
         "Chinese",
       ),
     ).toBe("wiki/concepts/反硝化除磷技术.md")
+  })
+
+  it("renames CJK pages under the default auto language by detecting the content language", () => {
+    const content = [
+      "---",
+      "type: concept",
+      "title: 反硝化除磷技术",
+      "created: 2026-06-18",
+      "---",
+      "",
+      "# 反硝化除磷技术",
+      "",
+      "这是一段中文正文，用于检测语言。",
+    ].join("\n")
+
+    expect(
+      rewriteIngestPathFromTitleForTargetLanguage(
+        "wiki/concepts/denitrifying-phosphorus-removal.md",
+        content,
+        "auto",
+      ),
+    ).toBe("wiki/concepts/反硝化除磷技术.md")
+  })
+
+  it("leaves English pages untouched under the default auto language", () => {
+    const content = [
+      "---",
+      "type: concept",
+      "title: Denitrifying phosphorus removal",
+      "---",
+      "",
+      "# Denitrifying phosphorus removal",
+      "",
+      "This is an English body used for language detection.",
+    ].join("\n")
+
+    expect(
+      rewriteIngestPathFromTitleForTargetLanguage(
+        "wiki/concepts/denitrifying-phosphorus-removal.md",
+        content,
+        "auto",
+      ),
+    ).toBe("wiki/concepts/denitrifying-phosphorus-removal.md")
+  })
+
+  it("uses a CJK title under auto when an ASCII structured body dominates the page", () => {
+    const sql = Array.from(
+      { length: 30 },
+      (_, index) => `CREATE TABLE audit_${index} (id BIGINT PRIMARY KEY, event_type VARCHAR(64));`,
+    ).join("\n")
+    const content = [
+      "---",
+      "type: concept",
+      "title: 审计数据模型",
+      "---",
+      "",
+      "# 审计数据模型",
+      "",
+      "```sql",
+      sql,
+      "```",
+    ].join("\n")
+
+    expect(
+      rewriteIngestPathFromTitleForTargetLanguage(
+        "wiki/concepts/audit-data-model.md",
+        content,
+        "auto",
+      ),
+    ).toBe("wiki/concepts/审计数据模型.md")
   })
 
   it("does not rewrite source summaries or aggregate pages", () => {

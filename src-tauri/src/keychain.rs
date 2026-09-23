@@ -89,15 +89,21 @@ fn hydrate_provider_keys(config: &mut Value, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn hydrate_headers(config: &mut Value) -> Result<(), String> {
-    if value_at(config, "embeddingConfig.extraHeaders").is_none() {
-        return Ok(());
+fn header_paths(config: &Value) -> Vec<String> {
+    let mut paths = vec!["embeddingConfig.extraHeaders".to_string(), "llmConfig.customHeaders".to_string()];
+    if let Some(providers) = config.get("providerConfigs").and_then(Value::as_object) {
+        paths.extend(providers.keys().map(|name| format!("providerConfigs.{name}.customHeaders")));
     }
-    let Some(value) = load("embeddingConfig.extraHeaders")? else {
-        return Ok(());
-    };
-    if let Ok(headers) = serde_json::from_str::<Value>(&value) {
-        set_at(config, "embeddingConfig.extraHeaders", headers)
+    paths.into_iter().filter(|path| value_at(config, path).is_some_and(Value::is_object)).collect()
+}
+
+fn hydrate_headers(config: &mut Value) -> Result<(), String> {
+    for path in header_paths(config) {
+        let Some(value) = load(&path)? else { continue };
+        let headers: Value = serde_json::from_str(&value)
+            .map_err(|_| "Invalid Keychain header value".to_string())?;
+        if !headers.is_object() { return Err("Invalid Keychain header value".to_string()); }
+        set_at(config, &path, headers);
     }
     Ok(())
 }
@@ -141,8 +147,19 @@ fn set_at(value: &mut Value, path: &str, next: Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::{set_at, valid_key, value_at};
+    use super::{header_paths, set_at, valid_key, value_at};
     use serde_json::json;
+
+    #[test]
+    fn discovers_redacted_header_paths_without_accessing_keychain() {
+        let value = json!({
+            "llmConfig": { "customHeaders": {} },
+            "embeddingConfig": { "extraHeaders": {} },
+            "providerConfigs": { "custom-example": { "customHeaders": {} }, "openai": { "apiKey": "" } }
+        });
+        assert_eq!(header_paths(&value), vec!["embeddingConfig.extraHeaders", "llmConfig.customHeaders", "providerConfigs.custom-example.customHeaders"]);
+        assert!(header_paths(&json!({ "llmConfig": { "customHeaders": [] } })).is_empty());
+    }
 
     #[test]
     fn only_accepts_stable_keychain_entry_names() {

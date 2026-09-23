@@ -39,6 +39,7 @@
  */
 import type { LlmConfig } from "@/stores/wiki-store"
 import { streamChat, type ChatMessage } from "./llm-client"
+import { resolveIngestReasoning } from "@/lib/reasoning-capabilities"
 
 /**
  * The "no surrounding text" prompt — same factual / verbatim /
@@ -69,6 +70,12 @@ import { streamChat, type ChatMessage } from "./llm-client"
 export const CAPTION_PROMPT =
   "Describe this image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. Do NOT speculate or editorialize. 2 to 4 sentences. Output plain text only — no markdown, no preamble."
 
+function captionLanguageInstruction(outputLanguage?: string): string {
+  const language = outputLanguage?.trim()
+  if (!language || language.toLowerCase() === "auto") return ""
+  return `Write the description in ${language}. Preserve visible text verbatim in its original language.`
+}
+
 /**
  * Build the prompt that gets used WHEN the caller supplies
  * surrounding text. Wraps the no-context prompt with an explicit
@@ -83,6 +90,7 @@ export const CAPTION_PROMPT =
 export function buildCaptionPromptWithContext(
   before: string,
   after: string,
+  outputLanguage?: string,
 ): string {
   const fmt = (s: string) => {
     const trimmed = s.trim()
@@ -100,7 +108,8 @@ export function buildCaptionPromptWithContext(
     "This surrounding text MAY help describe the image — for example, a sentence like \"Figure 3: Q2 revenue chart\" tells you what the chart actually plots. It MAY ALSO be unrelated body text that just happens to flank the image. Use your judgment: if a passage clearly identifies, references, or labels the image, anchor your caption to it; if not, ignore the surrounding text and describe what you see.",
     "",
     "Now describe the image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. If the surrounding text contains a relevant figure number / caption / referent, incorporate that specifically. Do NOT invent details that aren't visible in the image or directly stated in the surrounding text. 2 to 4 sentences. Output plain text only — no markdown, no preamble.",
-  ].join("\n")
+    captionLanguageInstruction(outputLanguage),
+  ].filter(Boolean).join("\n")
 }
 
 export interface CaptionOptions {
@@ -134,6 +143,8 @@ export interface CaptionOptions {
    */
   contextBefore?: string
   contextAfter?: string
+  /** Output language for the description. Visible source text stays verbatim. */
+  outputLanguage?: string
 }
 
 /**
@@ -172,8 +183,10 @@ export async function captionImage(
   const after = options?.contextAfter?.trim() ?? ""
   const promptText =
     before.length > 0 || after.length > 0
-      ? buildCaptionPromptWithContext(before, after)
-      : CAPTION_PROMPT
+      ? buildCaptionPromptWithContext(before, after, options?.outputLanguage)
+      : [CAPTION_PROMPT, captionLanguageInstruction(options?.outputLanguage)]
+          .filter(Boolean)
+          .join("\n")
 
   const messages: ChatMessage[] = [
     {
@@ -202,12 +215,9 @@ export async function captionImage(
     {
       temperature: options?.temperature ?? 0,
       max_tokens: options?.maxTokens ?? 4096,
-      // Captioning is a short factual vision task. If the main LLM is
-      // configured as a reasoning model, inheriting that setting here
-      // often burns the small caption budget on thinking and produces
-      // no usable alt text. Disable reasoning for caption calls unless
-      // this helper grows an explicit caption-reasoning option.
-      reasoning: { mode: "off" },
+      // Captioning is a short factual vision task, so reasoning defaults off.
+      // The ingest preference can enable it for models that require thinking.
+      reasoning: resolveIngestReasoning(llmConfig),
     },
   )
 

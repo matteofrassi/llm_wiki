@@ -32,7 +32,10 @@
 
 - **Two-Step Chain-of-Thought Ingest** — LLM analyzes first, then generates wiki pages with source traceability and incremental cache
 - **Multimodal Image Ingestion** — extract embedded images from PDFs, generate factual captions with a vision LLM, surface them in image-aware search results with lightbox preview and jump-to-source
-- **Optional MinerU PDF Parsing** — use MinerU cloud parsing for complex PDFs with tables, formulas, and dense layouts; the built-in local parser remains the default
+- **Multi-format Document Parsing** — ingest PDF, Office documents, EPUB/MOBI, Org mode, images, media, web clips, and batches of URLs, with built-in, cloud, or local MinerU PDF processing
+- **Flexible Model Configuration** — configure models per project, route Chat and Ingest independently, and manage custom providers, headers, and streaming output
+- **Source-grounded Retrieval** — use Read Sources Only mode to answer exclusively from original imported material
+- **Project Management & Migration** — export and import complete project archives across devices, and rebuild the Wiki index from existing pages
 - **4-Signal Knowledge Graph** — relevance model with direct links, source overlap, Adamic-Adar, and type affinity
 - **Louvain Community Detection** — automatic knowledge cluster discovery with cohesion scoring
 - **Graph Insights** — surprising connections and knowledge gaps with one-click Deep Research
@@ -303,14 +306,15 @@ The original focuses on text/markdown. We support structured extraction preservi
 
 | Format | Method |
 |--------|--------|
-| PDF | Built-in pdf-extract (Rust) with file caching; optional MinerU cloud parsing for tables, formulas, and complex layouts |
+| PDF | Built-in pdf-extract (Rust) with file caching; optional MinerU Cloud, Local API, or Pipeline parsing for complex layouts |
 | DOCX | docx-rs — headings, bold/italic, lists, tables → structured Markdown |
 | PPTX | ZIP + XML — slide-by-slide extraction with heading/list structure |
 | XLSX/XLS/ODS | calamine — proper cell types, multi-sheet support, Markdown tables |
+| EPUB/MOBI | Electronic book metadata, chapters, and body text → ingest-ready content |
 | Images | Native preview (png, jpg, gif, webp, svg, etc.) |
 | Video/Audio | Built-in player |
 
-> MinerU is optional. When enabled, PDF files are uploaded to MinerU cloud for parsing; keep the built-in parser for sensitive documents. If MinerU fails, LLM Wiki falls back to the built-in parser. MinerU usage is subject to its file size, page count, and quota limits.
+> MinerU is optional. Use MinerU Cloud, an official Local API endpoint, or Local Pipeline mode for complex PDFs. Local modes keep processing on your machine, and extracted images are stored in the project-managed `wiki/media` directory. If MinerU fails, LLM Wiki falls back to the built-in parser.
 
 ### 15. File Deletion with Cascade Cleanup
 
@@ -348,7 +352,10 @@ The original is platform-agnostic (abstract pattern). We handle concrete cross-p
 - **Obsidian config** — auto-generated `.obsidian/` directory with recommended settings
 - **Markdown rendering** — GFM tables with borders, proper code blocks, wikilink processing in chat and preview
 - **Multi-provider LLM support** — OpenAI, Anthropic, Google, Ollama, Custom — each with provider-specific streaming and headers
-- **15-minute timeout** — long ingest operations won't fail prematurely
+- **Configurable LLM timeout** — adjust request timeouts for slow local models and long-running operations
+- **Configurable Firecrawl** — optional API key and custom Base URL for hosted or self-hosted services
+- **Collapsible file sidebar** — collapse Knowledge/Files navigation while preserving its state
+- **Project maintenance** — ZIP export/import for migration and deterministic `wiki/index.md` rebuilding
 - **dataVersion signaling** — graph and UI automatically refresh when wiki content changes
 
 ## Tech Stack
@@ -362,8 +369,7 @@ The original is platform-agnostic (abstract pattern). We handle concrete cross-p
 | Graph | sigma.js + graphology + ForceAtlas2 |
 | Search | Tokenized search + graph relevance + optional vector (LanceDB) |
 | Vector DB | LanceDB (Rust, embedded, optional) |
-| PDF | pdf-extract + optional MinerU cloud parser |
-| Office | docx-rs + calamine |
+| Documents | pdf-extract + MinerU Cloud/Local + docx-rs + calamine + EPUB/MOBI extraction |
 | i18n | react-i18next |
 | State | Zustand |
 | LLM | Streaming fetch (OpenAI, Anthropic, Google, Ollama, Custom) |
@@ -381,10 +387,14 @@ Download from [Releases](https://github.com/nashsu/llm_wiki/releases):
 ### Build from Source
 
 ```bash
-# Prerequisites: Node.js 20+, Rust 1.70+
+# Prerequisites: Node.js 20+, Rust 1.88+, protoc
+#   macOS:  brew install protobuf
+#   Linux:  sudo apt install protobuf-compiler
+#   Windows: choco install protoc
 git clone https://github.com/nashsu/llm_wiki.git
 cd llm_wiki
 npm install
+npm --prefix mcp-server ci && npm run mcp:build   # mcp-server/dist is bundled as a Tauri resource
 npm run tauri dev      # Development
 npm run tauri build    # Production build
 ```
@@ -412,9 +422,10 @@ LLM Wiki ships a built-in local HTTP API at `http://127.0.0.1:19828` (token-prot
 - `PATCH /api/v1/projects/{id}/reviews/{reviewId}` — update one Review item (JSON body `{ "resolved": true, "action": "label" }`; `resolved` defaults to true, pass false to reopen)
 - `POST /api/v1/projects/{id}/reviews/resolve` — bulk-resolve Review items (JSON body `{ "ids": [...], "action": "label" }`), returns `{ resolved, notFound, count }`; the Review tab's Refresh button re-reads the result from disk
 - `POST /api/v1/projects/{id}/search` — **hybrid** retrieval (keyword + vector) returning `mode`, `tokenHits`, `vectorHits`, per-result `vectorScore`
-- `POST /api/v1/projects/{id}/chat` — non-streaming backend Agent chat endpoint returning an assistant message, references, usage, and tool events for wiki/source/web/AnyTXT retrieval; `mode: "deep"` broadens evidence collection, while the full Deep Research workspace remains available in the desktop UI
+- `POST /api/v1/projects/{id}/chat` — backend Agent chat endpoint for wiki/source/web/AnyTXT retrieval. JSON requests remain non-streaming by default; send `"stream": true` or `Accept: text/event-stream` for SSE events (`meta`, incremental `agent`, then `done`, `cancelled`, or `error`). The terminal `done` frame contains the complete aggregate response, so clients should not render both message deltas and the final message as separate answers. `mode: "deep"` broadens evidence collection, while the full Deep Research workspace remains available in the desktop UI
 - `GET /api/v1/projects/{id}/graph` — wikilinks graph
 - `POST /api/v1/projects/{id}/sources/rescan` — trigger a backend rescan
+- `POST /api/v1/projects/{id}/pages/embed` — index one externally created or updated `wiki/*.md` page without rebuilding the whole vector database
 
 Enable the API, generate a token, and choose whether local unauthenticated access is allowed in **Settings → API + MCP**.
 

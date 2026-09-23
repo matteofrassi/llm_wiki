@@ -93,7 +93,7 @@ describe("provider connection tests", () => {
       expect.any(Array),
       expect.any(Object),
       undefined,
-      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
     )
   })
 
@@ -142,11 +142,11 @@ describe("provider connection tests", () => {
 
       expect(result.ok).toBe(true)
       expect(streamChatMock).toHaveBeenCalledWith(
-        expect.objectContaining({ provider, localCliIsolation: initialIsolation }),
+        cfg,
         expect.any(Array),
         expect.any(Object),
         undefined,
-        { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+        { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
       )
       expect(cfg.localCliIsolation).toBe(initialIsolation)
     },
@@ -166,7 +166,7 @@ describe("provider connection tests", () => {
       expect.any(Array),
       expect.any(Object),
       undefined,
-      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
     )
   })
 })

@@ -41,6 +41,7 @@ import {
   enqueueIngest,
   enqueueBatch,
   clearQueueState,
+  pauseQueue,
   restoreQueue,
   getQueue,
 } from "./ingest-queue"
@@ -52,6 +53,7 @@ const mockAutoIngest = vi.mocked(autoIngest)
 let tmp: { path: string; cleanup: () => Promise<void> }
 
 beforeEach(async () => {
+  await pauseQueue()
   clearQueueState()
   mockAutoIngest.mockReset()
   // Hang forever so the task stays in "processing" state and the
@@ -75,6 +77,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  await pauseQueue()
   clearQueueState()
   await tmp.cleanup()
 })
@@ -164,7 +167,8 @@ describe("ingest-queue persistence — restore round-trip", () => {
       }
     })
 
-    // Simulate app restart: wipe in-memory, restore from disk
+    // Complete the real shutdown handshake before resetting this in-process fixture.
+    await pauseQueue()
     clearQueueState()
     expect(getQueue()).toHaveLength(0)
 
@@ -250,7 +254,8 @@ describe("ingest-queue persistence — restore round-trip", () => {
     expect(onDisk[0].sourcePath).toBe("raw/sources/注意力.pdf")
     expect(onDisk[0].folderContext).toBe("研究 > 深度学习")
 
-    clearQueueState()
+    await pauseQueue()
+  clearQueueState()
     await writeFileRaw(
       `${tmp.path}/.llm-wiki/ingest-queue.json`,
       JSON.stringify(onDisk, null, 2),

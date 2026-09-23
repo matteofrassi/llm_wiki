@@ -98,6 +98,10 @@ pub struct SearchEmbeddingConfig {
     /// by the client.
     #[serde(default)]
     pub extra_headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub max_chunk_chars: Option<usize>,
+    #[serde(default)]
+    pub overlap_chunk_chars: Option<usize>,
 }
 
 #[tauri::command]
@@ -132,6 +136,17 @@ pub async fn embedding_fetch(
 ) -> Result<Vec<f32>, String> {
     run_guarded_async("embedding_fetch", async move {
         fetch_embedding_with_retry(&text, &cfg, max_retries.unwrap_or(3)).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn embedding_fetch_batch(
+    texts: Vec<String>,
+    cfg: SearchEmbeddingConfig,
+) -> Result<Vec<Vec<f32>>, String> {
+    run_guarded_async("embedding_fetch_batch", async move {
+        fetch_embedding_batch(&texts, &cfg).await
     })
     .await
 }
@@ -1048,7 +1063,7 @@ pub fn extract_image_refs(content: &str) -> Vec<SearchImageRef> {
     out
 }
 
-async fn fetch_embedding_with_retry(
+pub(crate) async fn fetch_embedding_with_retry(
     text: &str,
     cfg: &SearchEmbeddingConfig,
     max_retries: usize,
@@ -1082,6 +1097,127 @@ async fn fetch_embedding_with_retry(
     }
 }
 
+pub(crate) async fn fetch_embedding_batch(
+    texts: &[String],
+    cfg: &SearchEmbeddingConfig,
+) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() || texts.len() > 64 {
+        return Err("Embedding batch must contain between 1 and 64 inputs".to_string());
+    }
+    if is_google_embedding_config(cfg) || is_doubao_multimodal_embedding_config(cfg) {
+        return Err(
+            "This embedding provider does not use the OpenAI-compatible batch format".to_string(),
+        );
+    }
+
+    let endpoint = volcengine_embedding_endpoint(cfg);
+    let mut req = crate::proxy::configure_http_client(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_secs(
+            SEARCH_EMBEDDING_TIMEOUT_SECS,
+        ))
+        .build()
+        .map_err(|e| format!("Embedding HTTP client error: {e}"))?
+        .post(&endpoint)
+        .header("Content-Type", "application/json");
+    if is_local_or_private_http_endpoint(&endpoint) {
+        req = req.header("Origin", "http://localhost");
+    }
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(cfg.api_key.trim());
+    }
+    if let Some(extra) = cfg.extra_headers.as_ref() {
+        for (name, value) in extra {
+            let name = name.trim();
+            let value = value.trim();
+            if !name.is_empty()
+                && !value.is_empty()
+                && is_safe_extra_header_name(name)
+                && !is_reserved_extra_header_name(name)
+            {
+                req = req.header(name, value);
+            }
+        }
+    }
+    let response = req
+        .json(&json!({ "model": cfg.model, "input": texts }))
+        .send()
+        .await
+        .map_err(|e| format!("Embedding batch request failed: {e}"))?;
+    let status = response.status();
+    let response_text = response
+        .text()
+        .await
+        .map_err(|e| format!("Embedding batch response read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Embedding batch API HTTP {status}: {}",
+            response_text.chars().take(200).collect::<String>()
+        ));
+    }
+    let data: Value = serde_json::from_str(&response_text).map_err(|e| {
+        format!(
+            "Embedding batch response parse failed: {e}: {}",
+            response_text.chars().take(200).collect::<String>()
+        )
+    })?;
+    parse_embedding_batch_values(&data, texts.len())
+}
+
+pub(crate) fn supports_embedding_batch(cfg: &SearchEmbeddingConfig) -> bool {
+    !is_google_embedding_config(cfg) && !is_doubao_multimodal_embedding_config(cfg)
+}
+
+fn parse_embedding_batch_values(data: &Value, expected: usize) -> Result<Vec<Vec<f32>>, String> {
+    let entries = data
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Embedding batch response missing data array".to_string())?;
+    if entries.len() != expected {
+        return Err(format!(
+            "Embedding batch returned {} vectors for {expected} inputs",
+            entries.len()
+        ));
+    }
+    let mut indexed = Vec::with_capacity(entries.len());
+    for (position, entry) in entries.iter().enumerate() {
+        let index = entry
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(position);
+        if index >= expected {
+            return Err("Embedding batch response contains an out-of-range index".to_string());
+        }
+        let values = entry
+            .get("embedding")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Embedding batch response missing vector".to_string())?;
+        let mut vector = Vec::with_capacity(values.len());
+        for value in values {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| "Embedding batch response contains non-number values".to_string())?;
+            if !number.is_finite() {
+                return Err("Embedding batch response contains non-finite values".to_string());
+            }
+            vector.push(number as f32);
+        }
+        if vector.is_empty() {
+            return Err("Embedding batch response vector is empty".to_string());
+        }
+        indexed.push((index, vector));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    if indexed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("Embedding batch response contains duplicate indexes".to_string());
+    }
+    let dimension = indexed.first().map(|(_, vector)| vector.len()).unwrap_or(0);
+    if indexed.iter().any(|(_, vector)| vector.len() != dimension) {
+        return Err("Embedding batch response contains inconsistent vector dimensions".to_string());
+    }
+    Ok(indexed.into_iter().map(|(_, vector)| vector).collect())
+}
+
 fn halve_text_on_char_boundary(text: &mut String) -> bool {
     let char_count = text.chars().count();
     if char_count <= 1 {
@@ -1108,7 +1244,7 @@ async fn fetch_embedding_once(
     } else {
         volcengine_embedding_endpoint(cfg)
     };
-    let mut req = reqwest::Client::builder()
+    let mut req = crate::proxy::configure_http_client(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(
             SEARCH_EMBEDDING_TIMEOUT_SECS,
         ))
@@ -1606,6 +1742,8 @@ mod tests {
             model: "gemini-embedding-001".to_string(),
             output_dimensionality: Some(768.0),
             extra_headers: None,
+            max_chunk_chars: None,
+            overlap_chunk_chars: None,
         };
 
         let endpoint = google_embedding_endpoint(&cfg);
@@ -1628,6 +1766,8 @@ mod tests {
             model: "doubao-embedding-text-240715".to_string(),
             output_dimensionality: None,
             extra_headers: None,
+            max_chunk_chars: None,
+            overlap_chunk_chars: None,
         };
         assert_eq!(
             volcengine_embedding_endpoint(&cfg),
@@ -1654,6 +1794,8 @@ mod tests {
             model: "doubao-embedding-vision".to_string(),
             output_dimensionality: None,
             extra_headers: None,
+            max_chunk_chars: None,
+            overlap_chunk_chars: None,
         };
 
         assert_eq!(
@@ -1677,6 +1819,8 @@ mod tests {
             model: "doubao-embedding-text-240715".to_string(),
             output_dimensionality: None,
             extra_headers: None,
+            max_chunk_chars: None,
+            overlap_chunk_chars: None,
         };
         assert_eq!(
             volcengine_embedding_endpoint(&cfg),
@@ -1712,6 +1856,8 @@ mod tests {
             model: "doubao-embedding-vision".to_string(),
             output_dimensionality: None,
             extra_headers: None,
+            max_chunk_chars: None,
+            overlap_chunk_chars: None,
         };
 
         assert!(is_doubao_multimodal_embedding_config(&cfg));
@@ -2089,5 +2235,29 @@ mod tests {
 
         assert_eq!(out.results[0].title, "Phrase");
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn parses_openai_batch_vectors_in_input_order() {
+        let response = json!({
+            "data": [
+                { "index": 1, "embedding": [2.0, 2.5] },
+                { "index": 0, "embedding": [1.0, 1.5] }
+            ]
+        });
+        let vectors = parse_embedding_batch_values(&response, 2).unwrap();
+        assert_eq!(vectors, vec![vec![1.0, 1.5], vec![2.0, 2.5]]);
+    }
+
+    #[test]
+    fn rejects_duplicate_openai_batch_indexes() {
+        let response = json!({
+            "data": [
+                { "index": 0, "embedding": [1.0] },
+                { "index": 0, "embedding": [2.0] }
+            ]
+        });
+        assert!(parse_embedding_batch_values(&response, 2)
+            .unwrap_err()
+            .contains("duplicate"));
     }
 }

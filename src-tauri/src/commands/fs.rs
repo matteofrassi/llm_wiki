@@ -12,7 +12,15 @@ use crate::panic_guard::run_guarded;
 use crate::types::wiki::FileNode;
 
 /// Known binary formats that need special extraction
-const OFFICE_EXTS: &[&str] = &["doc", "docx", "pptx", "xls", "xlsx", "odt", "ods", "odp"];
+/// Formats handled by AnyDoc's shared document model. Keep this list aligned
+/// with `anydoc::Format::from_extension`; the explicit list is still needed so
+/// arbitrary binary files never reach a parser merely because detection is
+/// permissive. PDF and EPUB intentionally remain on the existing pipelines:
+/// PDFium also extracts images, while the ebook path retains MOBI parity.
+const OFFICE_EXTS: &[&str] = &[
+    "doc", "docx", "docm", "ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm", "xls", "xlsx",
+    "xlsm", "xlsb", "odt", "ods", "odp", "rtf",
+];
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif", "heic", "heif", "svg",
 ];
@@ -20,7 +28,9 @@ const MEDIA_EXTS: &[&str] = &[
     "mp4", "webm", "mov", "avi", "mkv", "flv", "wmv", "m4v", "mp3", "wav", "ogg", "flac", "aac",
     "m4a", "wma",
 ];
-const LEGACY_DOC_EXTS: &[&str] = &["ppt", "pages", "numbers", "key", "epub"];
+const EBOOK_EXTS: &[&str] = &["epub", "mobi"];
+const LEGACY_DOC_EXTS: &[&str] = &["pages", "numbers", "key"];
+const OFFICE_CACHE_FORMAT: &str = "anydoc-0.1.6-v1";
 
 fn require_absolute_path(operation: &str, path: &str) -> Result<(), String> {
     if is_absolute_path_cross_platform(path) {
@@ -81,7 +91,9 @@ pub async fn read_file(path: String, extract_images: Option<bool>) -> Result<Str
 
             match ext.as_str() {
                 "pdf" => extract_pdf_text(&path, include_images),
+                "org" => extract_org_text(&path),
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e),
+                e if EBOOK_EXTS.contains(&e) => crate::commands::ebook::extract_ebook_text(&path, e),
                 e if IMAGE_EXTS.contains(&e) => {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     Ok(format!("[Image: {} ({:.1} KB)]", p.file_name().unwrap_or_default().to_string_lossy(), size as f64 / 1024.0))
@@ -132,7 +144,11 @@ pub async fn preprocess_file(path: String) -> Result<String, String> {
 
             let text = match ext.as_str() {
                 "pdf" => extract_pdf_text(&path, false)?,
+                "org" => extract_org_text(&path)?,
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e)?,
+                e if EBOOK_EXTS.contains(&e) => {
+                    crate::commands::ebook::extract_ebook_text(&path, e)?
+                }
                 _ => return Ok("no preprocessing needed".to_string()),
             };
 
@@ -151,8 +167,32 @@ fn cache_path_for(original: &Path) -> std::path::PathBuf {
     cache_dir.join(format!("{}.txt", file_name))
 }
 
+fn cache_format_path_for(original: &Path) -> std::path::PathBuf {
+    let cache_path = cache_path_for(original);
+    cache_path.with_extension("txt.parser")
+}
+
+fn uses_anydoc_cache(original: &Path) -> bool {
+    original
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            let extension = extension.to_ascii_lowercase();
+            OFFICE_EXTS.contains(&extension.as_str())
+        })
+        .unwrap_or(false)
+}
+
 fn read_cache(original: &Path) -> Option<String> {
     let cache_path = cache_path_for(original);
+    if uses_anydoc_cache(original)
+        && fs::read_to_string(cache_format_path_for(original))
+            .ok()?
+            .trim()
+            != OFFICE_CACHE_FORMAT
+    {
+        return None;
+    }
     let original_modified = fs::metadata(original).ok()?.modified().ok()?;
     let cache_modified = fs::metadata(&cache_path).ok()?.modified().ok()?;
     if cache_modified >= original_modified {
@@ -162,13 +202,165 @@ fn read_cache(original: &Path) -> Option<String> {
     }
 }
 
+/// Return a fresh preprocessing cache for Agent source retrieval.
+///
+/// Binary imports remain the referenced source of record; this helper only
+/// exposes their text extraction and never causes parsing or cache writes from
+/// a search request. Keeping freshness checks here also prevents the Agent
+/// from quoting a cache after the original file changed externally.
+pub(crate) fn read_preprocessed_cache(original: &Path) -> Option<String> {
+    read_cache(original)
+}
+
 fn write_cache(original: &Path, text: &str) -> Result<(), String> {
     let cache_path = cache_path_for(original);
     if let Some(parent) = cache_path.parent() {
-        fs::create_dir_all(parent).ok();
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create preprocessing cache directory: {e}"))?;
     }
     crate::commands::file_sync::mark_app_write_path(&cache_path);
-    fs::write(&cache_path, text).map_err(|e| format!("Failed to write cache: {}", e))
+    let format_path = cache_format_path_for(original);
+    if uses_anydoc_cache(original) {
+        // Remove the validity marker before replacing content. A crash or I/O
+        // error can then cause an extra rebuild, never acceptance of stale text.
+        let _ = fs::remove_file(&format_path);
+    }
+    fs::write(&cache_path, text).map_err(|e| format!("Failed to write cache: {e}"))?;
+    if uses_anydoc_cache(original) {
+        crate::commands::file_sync::mark_app_write_path(&format_path);
+        fs::write(&format_path, OFFICE_CACHE_FORMAT)
+            .map_err(|e| format!("Failed to write preprocessing cache format marker: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Convert common Org syntax into Markdown-shaped text for ingestion and
+/// preview. The original `.org` file remains untouched in `raw/sources`.
+/// Source blocks are copied verbatim inside fences and are never executed.
+fn extract_org_text(path: &str) -> Result<String, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read Org file '{}': {}", path, e))?;
+    Ok(org_to_markdown(&content))
+}
+
+fn org_to_markdown(content: &str) -> String {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let mut output = Vec::new();
+    let mut block_end: Option<&'static str> = None;
+
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if let Some(end) = block_end {
+            if upper == end {
+                output.push("```".to_string());
+                block_end = None;
+            } else {
+                output.push(line.to_string());
+            }
+            continue;
+        }
+
+        if upper.starts_with("#+BEGIN_SRC") {
+            let language = trimmed[11..].trim().split_whitespace().next().unwrap_or("");
+            output.push(format!("```{language}"));
+            block_end = Some("#+END_SRC");
+            continue;
+        }
+        if upper == "#+BEGIN_EXAMPLE" {
+            output.push("```text".to_string());
+            block_end = Some("#+END_EXAMPLE");
+            continue;
+        }
+        if upper == "#+BEGIN_QUOTE" {
+            output.push("```text".to_string());
+            block_end = Some("#+END_QUOTE");
+            continue;
+        }
+
+        if let Some((key, value)) = parse_org_keyword(trimmed) {
+            if key == "TITLE" {
+                output.push(format!("# {value}"));
+            } else if !matches!(key.as_str(), "OPTIONS" | "PROPERTY" | "SETUPFILE") {
+                output.push(format!("**{}:** {}", title_case_ascii(&key), value));
+            }
+            continue;
+        }
+
+        if let Some((level, heading)) = parse_org_heading(line) {
+            output.push(format!(
+                "{} {}",
+                "#".repeat(level.min(6)),
+                convert_org_links(heading)
+            ));
+            continue;
+        }
+
+        if trimmed.starts_with('|')
+            && trimmed.ends_with('|')
+            && trimmed.contains('+')
+            && trimmed
+                .chars()
+                .all(|c| matches!(c, '|' | '+' | '-' | ':' | ' '))
+        {
+            output.push(trimmed.replace('+', "|"));
+            continue;
+        }
+
+        output.push(convert_org_links(line));
+    }
+    if block_end.is_some() {
+        output.push("```".to_string());
+    }
+    output.join("\n")
+}
+
+fn parse_org_keyword(line: &str) -> Option<(String, &str)> {
+    let rest = line.strip_prefix("#+")?;
+    let (key, value) = rest.split_once(':')?;
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((key.to_ascii_uppercase(), value.trim()))
+}
+
+fn parse_org_heading(line: &str) -> Option<(usize, &str)> {
+    let stars = line.chars().take_while(|c| *c == '*').count();
+    if stars == 0 || line.as_bytes().get(stars) != Some(&b' ') {
+        return None;
+    }
+    Some((stars, line[stars + 1..].trim()))
+}
+
+fn title_case_ascii(value: &str) -> String {
+    let lower = value.replace('_', " ").to_ascii_lowercase();
+    let mut chars = lower.chars();
+    chars
+        .next()
+        .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+        .unwrap_or_default()
+}
+
+fn convert_org_links(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = &after[..end];
+        if let Some((target, description)) = inner.split_once("][") {
+            out.push_str(&format!("[{}]({})", description, target));
+        } else {
+            out.push_str(&format!("<{}>", inner));
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Global PDFium instance — the library prefers a single binding shared
@@ -400,6 +592,53 @@ fn extract_pdf_text(path: &str, include_images: bool) -> Result<String, String> 
 
 /// Extract text from Office Open XML formats, converting to Markdown.
 fn extract_office_text(path: &str, ext: &str) -> Result<String, String> {
+    let mut anydoc_failure = None;
+    match anydoc::to_markdown(path) {
+        Ok(markdown) if !markdown.trim().is_empty() => return Ok(markdown),
+        Ok(_) => {
+            eprintln!(
+                "[anydoc] '{}' produced empty Markdown; trying the compatibility parser",
+                path
+            );
+        }
+        Err(anydoc::ConvertError::ResourceLimit { limit, detail }) => {
+            // Never bypass AnyDoc's abuse limits by feeding the same hostile
+            // input to a less constrained compatibility parser.
+            return Err(format!(
+                "Document exceeds the AnyDoc safety limit '{limit}': {detail}"
+            ));
+        }
+        Err(anydoc::ConvertError::Encrypted) => {
+            return Err("Encrypted or password-protected documents are not supported".to_string());
+        }
+        Err(error) => {
+            eprintln!(
+                "[anydoc] failed to parse '{}' ({}); trying the compatibility parser",
+                path, error
+            );
+            anydoc_failure = Some(error.to_string());
+        }
+    }
+
+    extract_office_text_compat(path, ext).map_err(|compat_error| match anydoc_failure {
+        Some(anydoc_error) => format!(
+            "AnyDoc failed to extract .{ext}: {anydoc_error}; compatibility parser failed: {compat_error}"
+        ),
+        None => compat_error,
+    })
+}
+
+/// Compatibility path for formats supported before AnyDoc was introduced.
+/// New AnyDoc-only variants deliberately return the original-format error
+/// rather than being read as UTF-8 or reported as a successful empty import.
+fn extract_office_text_compat(path: &str, ext: &str) -> Result<String, String> {
+    if !matches!(
+        ext,
+        "doc" | "docx" | "pptx" | "xls" | "xlsx" | "odt" | "ods" | "odp"
+    ) {
+        return Err(format!("no compatibility parser is available for .{ext}"));
+    }
+
     // Spreadsheets: use calamine (supports xlsx, xls, ods)
     if matches!(ext, "xlsx" | "xls" | "ods") {
         return extract_spreadsheet(path);
@@ -423,7 +662,9 @@ fn extract_office_text(path: &str, ext: &str) -> Result<String, String> {
     match ext {
         "pptx" => extract_pptx_markdown(&mut archive),
         "odt" | "odp" => extract_odf_text(&mut archive),
-        _ => Ok("[Unsupported format]".to_string()),
+        _ => Err(format!(
+            "AnyDoc could not extract .{ext} and no compatibility parser is available"
+        )),
     }
 }
 
@@ -518,10 +759,12 @@ fn extract_docx_with_library(path: &str) -> Result<String, String> {
             docx_rs::DocumentChild::Table(table) => {
                 let mut rows: Vec<Vec<String>> = Vec::new();
                 for row in &table.rows {
-                    if let docx_rs::TableChild::TableRow(tr) = row {
+                    {
+                        let docx_rs::TableChild::TableRow(tr) = row;
                         let mut cells: Vec<String> = Vec::new();
                         for cell in &tr.cells {
-                            if let docx_rs::TableRowChild::TableCell(tc) = cell {
+                            {
+                                let docx_rs::TableRowChild::TableCell(tc) = cell;
                                 let mut cell_text = String::new();
                                 for child in &tc.children {
                                     if let docx_rs::TableCellContent::Paragraph(para) = child {
@@ -602,8 +845,6 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
     let chars: Vec<char> = xml.chars().collect();
     let len = chars.len();
 
-    // Track current paragraph state
-    let mut in_paragraph = false;
     let mut paragraph_text = String::new();
     let mut is_heading = false;
     let mut heading_level: u8 = 1;
@@ -619,7 +860,6 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
     while i < len {
         if chars[i] == '<' {
             // Read tag name
-            let tag_start = i;
             i += 1;
             let is_closing = i < len && chars[i] == '/';
             if is_closing {
@@ -645,7 +885,6 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
             match tag_name.as_str() {
                 // Paragraph start
                 "w:p" if !is_closing => {
-                    in_paragraph = true;
                     paragraph_text.clear();
                     is_heading = false;
                     in_list_item = false;
@@ -666,7 +905,6 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
                             result.push_str("\n\n");
                         }
                     }
-                    in_paragraph = false;
                     paragraph_text.clear();
                 }
                 // Heading style detection
@@ -1715,6 +1953,7 @@ pub async fn read_file_as_base64(path: String) -> Result<FileBase64, String> {
                 "bmp" => "image/bmp",
                 "tiff" | "tif" => "image/tiff",
                 "svg" => "image/svg+xml",
+                "pdf" => "application/pdf",
                 _ => "application/octet-stream",
             }
             .to_string();
@@ -1806,9 +2045,218 @@ pub async fn get_file_md5(path: String) -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[path = "fs_anydoc_benchmark.rs"]
+mod anydoc_benchmark;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn tmp_file_with_extension(extension: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "llm-wiki-anydoc-{}.{}",
+            uuid::Uuid::new_v4(),
+            extension
+        ));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn tmp_zip_with_entries(extension: &str, entries: &[(&str, &str)]) -> std::path::PathBuf {
+        let path = tmp_file_with_extension(extension, &[]);
+        let file = fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, content) in entries {
+            archive.start_file(*name, options).unwrap();
+            archive.write_all(content.as_bytes()).unwrap();
+        }
+        archive.finish().unwrap();
+        path
+    }
+
+    fn minimal_docx() -> std::path::PathBuf {
+        tmp_zip_with_entries(
+            "docx",
+            &[
+                (
+                    "[Content_Types].xml",
+                    r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+                ),
+                (
+                    "word/document.xml",
+                    r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>AnyDoc 中文 Word</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Value</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>Alpha</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>42</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#,
+                ),
+            ],
+        )
+    }
+
+    fn minimal_pptx() -> std::path::PathBuf {
+        tmp_zip_with_entries(
+            "pptx",
+            &[
+                (
+                    "[Content_Types].xml",
+                    r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#,
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#,
+                ),
+                (
+                    "ppt/presentation.xml",
+                    r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+                ),
+                (
+                    "ppt/_rels/presentation.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+                ),
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>AnyDoc 演示文稿</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+                ),
+            ],
+        )
+    }
+
+    fn minimal_xlsx() -> std::path::PathBuf {
+        tmp_zip_with_entries(
+            "xlsx",
+            &[
+                (
+                    "[Content_Types].xml",
+                    r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/workbook.xml",
+                    r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Metric</t></is></c><c r="B1" t="inlineStr"><is><t>Value</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>安全</t></is></c><c r="B2"><v>99</v></c></row></sheetData></worksheet>"#,
+                ),
+            ],
+        )
+    }
+
+    fn minimal_odt() -> std::path::PathBuf {
+        tmp_zip_with_entries(
+            "odt",
+            &[
+                ("mimetype", "application/vnd.oasis.opendocument.text"),
+                (
+                    "content.xml",
+                    r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text><text:h text:outline-level="1">AnyDoc ODT</text:h><text:p>跨平台开放文档内容。</text:p></office:text></office:body></office:document-content>"#,
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn anydoc_extracts_rtf_through_the_office_pipeline() {
+        let path = tmp_file_with_extension(
+            "rtf",
+            br#"{\rtf1\ansi\deff0 {\fonttbl {\f0 Arial;}}\f0\fs24 AnyDoc \b structured\b0 text.}"#,
+        );
+        let output = extract_office_text(path.to_str().unwrap(), "rtf").unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert!(output.contains("AnyDoc"));
+        assert!(output.contains("**structured**"));
+    }
+
+    #[test]
+    fn anydoc_extracts_generated_structured_document_fixtures() {
+        let fixtures = [
+            (
+                minimal_docx(),
+                "docx",
+                &["AnyDoc 中文 Word", "Alpha", "42"][..],
+            ),
+            (minimal_pptx(), "pptx", &["AnyDoc 演示文稿"][..]),
+            (minimal_xlsx(), "xlsx", &["Metric", "安全", "99"][..]),
+            (
+                minimal_odt(),
+                "odt",
+                &["AnyDoc ODT", "跨平台开放文档内容"][..],
+            ),
+        ];
+
+        for (path, extension, expected_fragments) in fixtures {
+            let output = extract_office_text(path.to_str().unwrap(), extension).unwrap();
+            for fragment in expected_fragments {
+                assert!(
+                    output.contains(fragment),
+                    ".{extension} output did not contain {fragment:?}: {output}"
+                );
+            }
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn anydoc_only_formats_do_not_report_success_after_parse_failure() {
+        let path = tmp_file_with_extension("xlsb", b"not a workbook");
+        let result = extract_office_text(path.to_str().unwrap(), "xlsb");
+        fs::remove_file(path).unwrap();
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("AnyDoc failed to extract .xlsb"));
+        assert!(error.contains("no compatibility parser"));
+    }
+
+    #[test]
+    fn office_cache_requires_the_current_anydoc_format_marker() {
+        let path = tmp_file_with_extension("docx", b"source placeholder");
+        let cache_path = cache_path_for(&path);
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, "legacy parser output").unwrap();
+        assert_eq!(read_cache(&path), None);
+
+        fs::write(cache_format_path_for(&path), OFFICE_CACHE_FORMAT).unwrap();
+        assert_eq!(read_cache(&path).as_deref(), Some("legacy parser output"));
+
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(cache_path).unwrap();
+        fs::remove_file(cache_format_path_for(&path)).unwrap();
+    }
+
+    #[test]
+    fn org_to_markdown_preserves_common_elements_without_executing_source_blocks() {
+        let input = "#+TITLE: Research Notes\r\n#+AUTHOR: Ada\r\n* TODO Topic :rust:notes:\r\nParagraph with [[https://example.com][reference]] and [[file:local.pdf]].\r\n- [ ] Verify\r\n| Name | Value |\r\n|------+-------|\r\n| A    | 1     |\r\n#+BEGIN_SRC sh\r\necho never-run\r\n#+END_SRC\r\n";
+        let output = org_to_markdown(input);
+        assert!(output.contains("# Research Notes"));
+        assert!(output.contains("**Author:** Ada"));
+        assert!(output.contains("# TODO Topic :rust:notes:"));
+        assert!(output.contains("[reference](https://example.com)"));
+        assert!(output.contains("<file:local.pdf>"));
+        assert!(output.contains("|------|-------|"));
+        assert!(output.contains("```sh\necho never-run\n```"));
+    }
+
+    #[test]
+    fn org_to_markdown_closes_unterminated_source_block_and_keeps_unknown_lines() {
+        let output = org_to_markdown(
+            "#+OPTIONS: toc:nil\n#+CUSTOM: kept\n* Heading\n#+BEGIN_SRC python\nprint('text only')",
+        );
+        assert!(!output.contains("OPTIONS"));
+        assert!(output.contains("**Custom:** kept"));
+        assert!(output.ends_with("```"));
+    }
 
     /// Write `bytes` to a fresh tmp path with `.pdf` suffix and return
     /// the path (the OS tmpdir is NOT cleaned up — acceptable for tests).

@@ -14,7 +14,7 @@
  * Example:
  *   RUN_API_TESTS=1 \
  *   API_PROJECT_ID=a0e90b29-fcf3-4364-9502-8bd1272de820 \
- *   API_TOKEN=<token-if-required> \
+ *   API_TOKEN=<token> \
  *   npx vitest run src/lib/api-server.real-llm.test.ts
  */
 import { describe, expect, it } from "vitest"
@@ -28,8 +28,8 @@ const ENABLED = process.env.RUN_API_TESTS === "1" || process.env.RUN_LLM_TESTS =
 const BASE_URL = process.env.API_BASE_URL ?? API_SERVER_BASE_URL
 const PROJECT_ID =
   process.env.API_PROJECT_ID ?? "a0e90b29-fcf3-4364-9502-8bd1272de820"
-const API_TOKEN = process.env.API_TOKEN ?? process.env.LLM_WIKI_API_TOKEN ?? ""
-const TEST_TOKEN = process.env.API_TEST_TOKEN ?? "llm-wiki-real-api-test-token"
+const apiToken = process.env.API_TOKEN ?? process.env.LLM_WIKI_API_TOKEN ?? ""
+const testToken = process.env.API_TEST_TOKEN ?? "fixture"
 
 const TEST_TIMEOUT_MS = 30_000
 const RESCAN_TIMEOUT_MS = 60_000
@@ -40,6 +40,20 @@ interface ApiEnvelope {
   [key: string]: unknown
 }
 
+interface ApiChatEnvelope extends ApiEnvelope {
+  sessionId?: string
+  message?: {
+    role?: string
+    content?: string
+  }
+  usage?: {
+    promptChars?: number
+    completionChars?: number
+    referenceCount?: number
+    toolEventCount?: number
+  }
+}
+
 interface ApiHealth extends ApiEnvelope {
   status?: string
   enabled?: boolean
@@ -48,6 +62,11 @@ interface ApiHealth extends ApiEnvelope {
   allowUnauthenticated?: boolean
   allowLanAccess?: boolean
   tokenSource?: "env" | "store" | "none"
+  agent?: {
+    chat?: boolean
+    streaming?: boolean
+    streamProtocol?: string
+  }
 }
 
 interface ApiProject {
@@ -106,7 +125,7 @@ function endpoint(path: string): string {
 }
 
 function authHeaders(): Record<string, string> {
-  return API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}
+  return apiToken ? { Authorization: `Bearer ${apiToken}` } : {}
 }
 
 async function api<T extends ApiEnvelope>(
@@ -115,7 +134,7 @@ async function api<T extends ApiEnvelope>(
   options: { auth?: "default" | "none" | "bearer" | "xToken"; token?: string } = {},
 ): Promise<{ status: number; body: T }> {
   const authMode = options.auth ?? "default"
-  const token = options.token ?? API_TOKEN
+  const token = options.token ?? apiToken
   const auth =
     authMode === "none"
       ? {}
@@ -206,7 +225,7 @@ async function requireUsableApi(): Promise<ApiHealth> {
   const h = await health()
   expect(h.status).toBe("running")
   expect(h.enabled).toBe(true)
-  if (h.authRequired && !h.allowUnauthenticated && !API_TOKEN) {
+  if (h.authRequired && !h.allowUnauthenticated && !apiToken) {
     throw new Error(
       "API requires auth. Re-run with API_TOKEN=<token> or enable Settings -> API + MCP -> Allow access without a token.",
     )
@@ -339,6 +358,11 @@ describe.skipIf(!ENABLED)("local API v1 against real project", () => {
       expect(typeof h.authConfigured).toBe("boolean")
       expect(typeof h.allowUnauthenticated).toBe("boolean")
       expect(["env", "store", "none"]).toContain(h.tokenSource)
+      expect(h.agent).toMatchObject({
+        chat: true,
+        streaming: true,
+        streamProtocol: "sse",
+      })
     },
     TEST_TIMEOUT_MS,
   )
@@ -347,14 +371,14 @@ describe.skipIf(!ENABLED)("local API v1 against real project", () => {
     "enforces the token auth matrix when auth is required",
     async (ctx) => {
       ensureMutableAppState(ctx)
-      await writeApiConfig({ enabled: true, allowUnauthenticated: false, token: TEST_TOKEN })
+      await writeApiConfig({ enabled: true, allowUnauthenticated: false, token: testToken })
       const h = await waitForHealth(
         (value) => value.enabled === true && value.allowUnauthenticated === false && value.authRequired === true,
         "auth required",
       )
-      const effectiveToken = h.tokenSource === "env" ? API_TOKEN : TEST_TOKEN
+      const effectiveToken = h.tokenSource === "env" ? apiToken : testToken
       if (!effectiveToken) {
-        console.warn("Skipping positive auth checks because the running app uses LLM_WIKI_API_TOKEN and API_TOKEN was not provided.")
+        console.warn("Skipping positive auth checks because the running app uses LLM_WIKI_API_TOKEN and apiToken was not provided.")
       }
 
       const noToken = await api<ApiEnvelope>("/api/v1/projects", {}, { auth: "none" })
@@ -398,12 +422,12 @@ describe.skipIf(!ENABLED)("local API v1 against real project", () => {
     "honors the enabled=false kill switch",
     async (ctx) => {
       ensureMutableAppState(ctx)
-      await writeApiConfig({ enabled: false, allowUnauthenticated: false, token: TEST_TOKEN })
+      await writeApiConfig({ enabled: false, allowUnauthenticated: false, token: testToken })
       await waitForHealth((value) => value.enabled === false, "API disabled")
       const resp = await api<ApiEnvelope>(
         "/api/v1/projects",
         {},
-        { auth: "bearer", token: API_TOKEN || TEST_TOKEN },
+        { auth: "bearer", token: apiToken || testToken },
       )
       expect(resp.status).toBe(503)
       expect(resp.body.error).toContain("disabled")
@@ -425,6 +449,18 @@ describe.skipIf(!ENABLED)("local API v1 against real project", () => {
       expect(resp.body.ok).toBe(true)
       expect(Array.isArray(resp.body.projects)).toBe(true)
       expect(resp.body.currentProject == null || resp.body.currentProject.current).toBe(true)
+
+      const chat = await api<ApiEnvelope>(
+        "/api/v1/projects/current/chat",
+        {
+          method: "POST",
+          body: JSON.stringify({ message: "This request must be rejected before calling an LLM.", stream: true }),
+        },
+        { auth: "none" },
+      )
+      expect(chat.status).toBe(401)
+      expect(chat.body.ok).toBe(false)
+      expect(chat.body.error).toContain("Unauthorized")
     },
     TEST_TIMEOUT_MS,
   )
@@ -598,16 +634,70 @@ describe.skipIf(!ENABLED)("local API v1 against real project", () => {
   )
 
   it(
-    "reports chat as not implemented in API v1",
+    "runs backend Agent chat through API v1",
     async (ctx) => {
       ensureServer(ctx)
       await requireUsableApi()
-      const chatResp = await api<ApiEnvelope>(`/api/v1/projects/${PROJECT_ID}/chat`, {
+      if (!apiToken) {
+        console.warn("Skipping Agent chat API assertion because this endpoint always requires a token.")
+        ctx.skip()
+      }
+      const chatResp = await api<ApiChatEnvelope>(`/api/v1/projects/${PROJECT_ID}/chat`, {
         method: "POST",
         body: JSON.stringify({ message: "hello" }),
       })
-      expect(chatResp.status).toBe(501)
-      expect(chatResp.body.ok).toBe(false)
+      expect(chatResp.status).toBe(200)
+      expect(chatResp.body.ok).toBe(true)
+      expect(chatResp.body.sessionId).toEqual(expect.any(String))
+      expect(chatResp.body.sessionId?.length).toBeGreaterThan(0)
+      expect(chatResp.body.message?.role).toBe("assistant")
+      expect(chatResp.body.message?.content?.trim().length).toBeGreaterThan(0)
+      expect(chatResp.body.usage).toMatchObject({
+        promptChars: expect.any(Number),
+        completionChars: expect.any(Number),
+        referenceCount: expect.any(Number),
+        toolEventCount: expect.any(Number),
+      })
+      expect(chatResp.body.usage?.completionChars).toBeGreaterThan(0)
+    },
+    TEST_TIMEOUT_MS,
+  )
+
+  it(
+    "streams backend Agent chat through SSE",
+    async (ctx) => {
+      ensureServer(ctx)
+      await requireUsableApi()
+      if (!apiToken) {
+        console.warn("Skipping streaming Agent chat assertion because this endpoint always requires a token.")
+        ctx.skip()
+      }
+      const response = await fetch(endpoint(`/api/v1/projects/${PROJECT_ID}/chat`), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiToken}`,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({ message: "Reply with one short sentence.", stream: true }),
+      })
+      expect(response.status).toBe(200)
+      expect(response.headers.get("content-type")).toContain("text/event-stream")
+      const body = await response.text()
+      const metaIndex = body.indexOf("event: meta\n")
+      const agentIndex = body.indexOf("event: agent\n")
+      const doneIndex = body.indexOf("event: done\n")
+      expect(metaIndex).toBeGreaterThanOrEqual(0)
+      expect(agentIndex).toBeGreaterThan(metaIndex)
+      expect(doneIndex).toBeGreaterThan(agentIndex)
+      const doneData = body
+        .split("\n\n")
+        .find((frame) => frame.startsWith("event: done\n"))
+        ?.split("\ndata: ")[1]
+      expect(doneData).toBeTruthy()
+      const done = JSON.parse(doneData ?? "{}") as ApiChatEnvelope
+      expect(done.ok).toBe(true)
+      expect(done.message?.content?.trim().length).toBeGreaterThan(0)
     },
     TEST_TIMEOUT_MS,
   )
