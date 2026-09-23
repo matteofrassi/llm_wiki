@@ -302,6 +302,9 @@ fn build_codex_cli_args(model: &str, isolate_local_config: bool) -> Vec<String> 
         args.extend([
             "--ignore-user-config".to_string(),
             "--ignore-rules".to_string(),
+            // Preserve OS-backed authentication while excluding user rules and tools.
+            "-c".to_string(),
+            "cli_auth_credentials_store=\"auto\"".to_string(),
         ]);
     }
 
@@ -422,6 +425,7 @@ mod tests {
         assert!(args.contains(&"gpt-5".to_string()));
         assert!(!args.contains(&"--ignore-user-config".to_string()));
         assert!(!args.contains(&"--ignore-rules".to_string()));
+        assert!(!args.contains(&"cli_auth_credentials_store=\"auto\"".to_string()));
     }
 
     #[test]
@@ -436,9 +440,21 @@ mod tests {
             .iter()
             .position(|arg| arg == "--ignore-rules")
             .expect("ignore-rules arg");
+        let credential_override_pos = args
+            .iter()
+            .position(|arg| arg == "cli_auth_credentials_store=\"auto\"")
+            .expect("credential store override");
 
         assert!(ignore_config_pos > exec_pos);
         assert!(ignore_rules_pos > exec_pos);
+        assert!(credential_override_pos > exec_pos);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "cli_auth_credentials_store=\"auto\"")
+                .count(),
+            1
+        );
+        assert_eq!(args[credential_override_pos - 1], "-c");
     }
 
     struct TestDir(PathBuf);
