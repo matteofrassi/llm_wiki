@@ -13,15 +13,17 @@ import {
   type ApiGraphNode,
   type ApiReviewItem,
   type ApiReviewsResponse,
-  type ApiChatResponse,
   type ApiSearchResult,
 } from "./api-client.js"
 import { VERSION } from "./version.js"
+import { pathToFileURL } from "node:url"
+import { realpathSync } from "node:fs"
+import { requireProjectBinding, validateReadOnlyArguments } from "./read-only-policy.js"
 
-const DEFAULT_PROJECT_ID = "current"
 const MAX_TEXT_BYTES = 120_000
 
-const client = new LlmWikiApiClient()
+export function createReadOnlyServer(client: LlmWikiApiClient, canonicalProjectId: string): Server {
+requireProjectBinding(canonicalProjectId)
 
 const server = new Server(
   { name: "llm-wiki", version: VERSION },
@@ -50,14 +52,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "llm_wiki_files",
-      description: "List files from a project using the desktop app's API permissions. project_id may be a UUID, filesystem path, or 'current'.",
+      description: "List files from a project using the desktop app's API permissions. Use only the configured canonical project.",
       inputSchema: {
         type: "object",
         properties: {
-          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          project_id: { type: "string", description: "Configured project identifier or 'current', which always refers to the pinned project." },
           root: { type: "string", enum: ["wiki", "sources", "all"], description: "Tree root to list. Defaults to wiki." },
           recursive: { type: "boolean", description: "Whether to list recursively. Defaults to true." },
-          max_files: { type: "number", description: "Maximum files returned by the local API. Max 10000." },
+          max_files: { type: "integer", minimum: 1, maximum: 500, description: "Maximum files returned. Range 1-500; default 200." },
         },
         additionalProperties: false,
       },
@@ -68,7 +70,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          project_id: { type: "string", description: "Configured project identifier or 'current', which always refers to the pinned project." },
           path: { type: "string", description: "Project-relative file path, for example wiki/index.md." },
         },
         required: ["path"],
@@ -81,184 +83,132 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          project_id: { type: "string", description: "Configured project identifier or 'current', which always refers to the pinned project." },
           status: { type: "string", enum: ["unresolved", "resolved", "all"], description: "Review status filter. Defaults to unresolved." },
           type: { type: "string", description: "Optional Review item type filter, for example missing-page, duplicate, contradiction, confirm, or suggestion." },
-          limit: { type: "number", description: "Maximum review items returned. The local API clamps to its configured maximum." },
+          limit: { type: "integer", minimum: 1, maximum: 100, description: "Maximum review items returned. The local API clamps to its configured maximum." },
         },
         additionalProperties: false,
       },
     },
     {
       name: "llm_wiki_search",
-      description: "Search a project using the same backend keyword/vector retrieval used by the desktop API.",
+      description: "Search the canonical project locally by keywords and graph; never call an embedding or language-model provider.",
       inputSchema: {
         type: "object",
         properties: {
-          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          project_id: { type: "string", description: "Configured project identifier or 'current', which always refers to the pinned project." },
           query: { type: "string", description: "Search query." },
-          top_k: { type: "number", description: "Maximum results. The local API clamps to its configured maximum." },
+          top_k: { type: "integer", minimum: 1, maximum: 20, description: "Maximum results. The local API clamps to its configured maximum." },
           include_content: { type: "boolean", description: "Include full page content in results when supported by the API." },
         },
         required: ["query"],
         additionalProperties: false,
       },
     },
-    {
-      name: "llm_wiki_chat",
-      description: "Ask the LLM Wiki backend Agent a question about a project. This initial backend Agent uses the desktop API's shared retrieval service and returns references.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
-          message: { type: "string", description: "User message or question." },
-          session_id: { type: "string", description: "Optional caller-managed session id." },
-          mode: { type: "string", enum: ["fast", "standard", "deep", "local_first"], description: "Agent mode. Defaults to standard." },
-          top_k: { type: "number", description: "Maximum wiki references to retrieve. The API clamps to its configured maximum." },
-          include_content: { type: "boolean", description: "Include full page content in retrieval when supported by the API. Defaults to false." },
-          wiki: { type: "boolean", description: "Enable wiki retrieval. Defaults to true." },
-          web: { type: "boolean", description: "Enable backend web.search when the Agent router decides external search is useful. Defaults to false." },
-          anytxt: { type: "boolean", description: "Enable backend anytxt.search for source/local-file questions when AnyTXT is configured. Defaults to false." },
-          skills: {
-            type: "array",
-            items: { type: "string" },
-            description: "Optional project skills to inject from .llm-wiki/skills.",
-          },
-        },
-        required: ["message"],
-        additionalProperties: false,
-      },
-    },
+
     {
       name: "llm_wiki_graph",
       description: "Query the project knowledge graph through the desktop app API.",
       inputSchema: {
         type: "object",
         properties: {
-          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          project_id: { type: "string", description: "Configured project identifier or 'current', which always refers to the pinned project." },
           q: { type: "string", description: "Optional text filter." },
           node_type: { type: "string", description: "Optional node type filter." },
-          limit: { type: "number", description: "Maximum nodes. The local API clamps to its configured maximum." },
+          limit: { type: "integer", minimum: 1, maximum: 200, description: "Maximum nodes. The local API clamps to its configured maximum." },
         },
         additionalProperties: false,
       },
     },
-    {
-      name: "llm_wiki_rescan_sources",
-      description: "Trigger the desktop app's source folder rescan for a project, using the user's Source Watch rules.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
-        },
-        additionalProperties: false,
-      },
-    },
-  ],
+
+  ].map(tool => ({...tool, annotations: {readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false}})),
 }))
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = asObject(request.params.arguments ?? {})
   try {
+    validateReadOnlyArguments(request.params.name, args, canonicalProjectId)
     switch (request.params.name) {
       case "llm_wiki_status": {
-        const [health, projects] = await Promise.all([
-          client.health(),
-          client.projects().catch(() => ({ projects: [], currentProject: null })),
-        ])
-        return textResult(JSON.stringify({ ...health, ...projects }, null, 2))
+        const health = await client.health()
+        return textResult(JSON.stringify({enabled:health.enabled === true, mcpEnabled:health.mcpEnabled === true, authRequired:health.authRequired === true, allowLanAccess:health.allowLanAccess, localOnlySearch:health.localOnlySearch === true, canonicalProjectId}, null, 2))
       }
       case "llm_wiki_projects": {
         await assertMcpEnabled()
-        return textResult(JSON.stringify(await client.projects(), null, 2))
+        const projects = await client.projects()
+        return textResult(JSON.stringify({projects:projects.projects.filter(p=>p.id===canonicalProjectId),currentProject:projects.currentProject?.id===canonicalProjectId ? projects.currentProject : null}, null, 2))
       }
       case "llm_wiki_files": {
         await assertMcpEnabled()
-        const response = await client.files(projectId(args), {
+        const response = await client.files(canonicalProjectId, {
           root: enumArg(args.root, ["wiki", "sources", "all"] as const, "wiki"),
           recursive: boolArg(args.recursive, true),
-          maxFiles: numberArg(args.max_files),
+          maxFiles: numberArg(args.max_files) ?? 200,
         })
         return textResult(formatFileTree(response.files, response.truncated))
       }
       case "llm_wiki_read_file": {
         await assertMcpEnabled()
         const relPath = stringArg(args.path, "path")
-        const { path, content } = await client.fileContent(projectId(args), relPath)
+        const { path, content } = await client.fileContent(canonicalProjectId, relPath)
         return textResult(`# ${path}\n\n${truncateText(content, MAX_TEXT_BYTES)}`)
       }
       case "llm_wiki_reviews": {
         await assertMcpEnabled()
-        const reviews = await client.reviews(projectId(args), {
+        const reviews = await client.reviews(canonicalProjectId, {
           status: enumArg(args.status, ["unresolved", "resolved", "all"] as const, "unresolved"),
           type: optionalStringArg(args.type),
-          limit: numberArg(args.limit),
+          limit: numberArg(args.limit) ?? 50,
         })
         return textResult(formatReviews(reviews))
       }
       case "llm_wiki_search": {
-        await assertMcpEnabled()
+        await assertMcpEnabled(true)
         const query = stringArg(args.query, "query")
-        const search = await client.search(projectId(args), query, {
-          topK: numberArg(args.top_k),
+        const search = await client.search(canonicalProjectId, query, {
+          topK: numberArg(args.top_k) ?? 10,
           includeContent: boolArg(args.include_content, false),
+          localOnly: true,
         })
         return textResult(formatSearchResults(query, search))
       }
-      case "llm_wiki_chat": {
-        await assertMcpEnabled()
-        const message = stringArg(args.message, "message")
-        const chat = await client.chat(projectId(args), message, {
-          sessionId: optionalStringArg(args.session_id),
-          mode: enumArg(args.mode, ["fast", "standard", "deep", "local_first"] as const, "standard"),
-          topK: numberArg(args.top_k),
-          includeContent: boolArg(args.include_content, false),
-          wiki: boolArg(args.wiki, true),
-          web: boolArg(args.web, false),
-          anytxt: boolArg(args.anytxt, false),
-          skills: stringArrayArg(args.skills),
-          persistSession: optionalStringArg(args.session_id) !== undefined,
-        })
-        return textResult(formatChatResponse(chat))
-      }
+
       case "llm_wiki_graph": {
         await assertMcpEnabled()
-        const graph = await client.graph(projectId(args), {
+        const graph = await client.graph(canonicalProjectId, {
           q: optionalStringArg(args.q),
           nodeType: optionalStringArg(args.node_type),
-          limit: numberArg(args.limit),
+          limit: numberArg(args.limit) ?? 100,
         })
         return textResult(formatGraph(graph.nodes, graph.edges))
       }
-      case "llm_wiki_rescan_sources": {
-        await assertMcpEnabled()
-        return textResult(JSON.stringify(await client.rescan(projectId(args)), null, 2))
-      }
+
       default:
-        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`)
+        throw new McpError(ErrorCode.MethodNotFound, "Tool unavailable in the read-only profile")
     }
   } catch (err) {
     if (err instanceof McpError) throw err
     throw new McpError(
       ErrorCode.InternalError,
-      err instanceof Error ? err.message : String(err),
+      err instanceof Error && err.message.startsWith("LLM Wiki API ") ? err.message : "LLM Wiki read-only operation failed",
     )
   }
 })
 
-async function assertMcpEnabled(): Promise<void> {
+async function assertMcpEnabled(localSearch = false): Promise<void> {
   const health = await client.health()
-  if (health.mcpEnabled === false) {
-    throw new McpError(
-      ErrorCode.InvalidRequest,
-      "LLM Wiki MCP access is disabled. Enable Settings -> API + MCP -> Enable MCP access in the desktop app.",
-    )
+  if (health.enabled !== true || health.mcpEnabled !== true || health.authRequired !== true || health.authConfigured !== true || health.allowUnauthenticated !== false || health.allowLanAccess !== false) {
+    throw new McpError(ErrorCode.InvalidRequest, "Require enabled, authenticated, loopback-only MCP access in the application")
   }
+  if (localSearch && health.localOnlySearch !== true) throw new McpError(ErrorCode.InvalidRequest, "Update the application before using deterministic local search")
+}
+return server
 }
 
 function textResult(text: string) {
   return {
-    content: [{ type: "text" as const, text }],
+    content: [{ type: "text" as const, text: truncateText(text, MAX_TEXT_BYTES) }],
   }
 }
 
@@ -267,9 +217,6 @@ function asObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
-function projectId(args: Record<string, unknown>): string {
-  return optionalStringArg(args.project_id) ?? DEFAULT_PROJECT_ID
-}
 
 function stringArg(value: unknown, name: string): string {
   if (typeof value !== "string" || value.trim() === "") {
@@ -294,10 +241,6 @@ function enumArg<T extends string>(value: unknown, allowed: readonly T[], fallba
   return typeof value === "string" && allowed.includes(value as T) ? value as T : fallback
 }
 
-function stringArrayArg(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  return value.filter((item): item is string => typeof item === "string" && item.trim() !== "")
-}
 
 function truncateText(value: string, maxBytes: number): string {
   const bytes = Buffer.byteLength(value, "utf8")
@@ -351,42 +294,6 @@ function formatSearchResults(query: string, search: { results: ApiSearchResult[]
   return lines.join("\n")
 }
 
-function formatChatResponse(chat: ApiChatResponse): string {
-  const lines = [
-    "# LLM Wiki Agent response",
-    "",
-    `Session: ${chat.sessionId || "(none)"}`,
-    chat.mode ? `Mode: ${chat.mode}` : null,
-    chat.projectId ? `Project: ${chat.projectId}` : null,
-    chat.usage
-      ? `Usage: promptChars=${chat.usage.promptChars ?? 0}, completionChars=${chat.usage.completionChars ?? 0}, references=${chat.usage.referenceCount ?? chat.references.length}`
-      : null,
-    "",
-    chat.message.content || "(empty response)",
-    "",
-  ].filter((line): line is string => line !== null)
-
-  if (chat.references.length > 0) {
-    lines.push("## References")
-    chat.references.forEach((reference, index) => {
-      lines.push(`${index + 1}. ${reference.title || reference.path}`)
-      lines.push(`   Kind: ${reference.kind}`)
-      lines.push(`   Path: ${reference.path}`)
-      if (typeof reference.score === "number") lines.push(`   Score: ${reference.score.toFixed(6)}`)
-      if (reference.snippet) lines.push(`   Snippet: ${reference.snippet}`)
-    })
-    lines.push("")
-  }
-
-  if (chat.toolEvents.length > 0) {
-    lines.push("## Tool events")
-    chat.toolEvents.forEach((event) => {
-      lines.push(`- ${event.tool}: ${event.status}${event.detail ? ` (${event.detail})` : ""}`)
-    })
-  }
-
-  return lines.join("\n")
-}
 
 function formatReviews(response: ApiReviewsResponse): string {
   const { reviews } = response
@@ -450,12 +357,15 @@ function formatGraph(nodes: ApiGraphNode[], edges: Array<{ source: string; targe
 }
 
 async function main(): Promise<void> {
-  const transport = new StdioServerTransport()
-  await server.connect(transport)
-  console.error(`LLM Wiki MCP server v${VERSION} connected to ${process.env.LLM_WIKI_API_BASE_URL ?? "http://127.0.0.1:19828"}`)
+  if (!process.env.LLM_WIKI_API_TOKEN?.trim()) throw new Error("missing_token")
+  const server = createReadOnlyServer(new LlmWikiApiClient(), process.env.LLM_WIKI_PROJECT_ID ?? "")
+  await server.connect(new StdioServerTransport())
+  console.error(`LLM Wiki read-only MCP v${VERSION} ready`)
 }
 
-main().catch((err) => {
-  console.error("Failed to start LLM Wiki MCP server:", err)
-  process.exit(1)
-})
+if (process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
+  main().catch(() => {
+    console.error("LLM Wiki MCP startup failed; check the approved local launcher and project configuration")
+    process.exitCode = 1
+  })
+}

@@ -230,6 +230,7 @@ fn handle_request(
             "tokenSource": api_token_source(app),
             "enabled": api_enabled(app),
             "mcpEnabled": api_mcp_enabled(app),
+            "localOnlySearch": true,
             "allowUnauthenticated": api_allow_unauthenticated(app),
             "allowLanAccess": api_allow_lan_access(app),
             "agent": {
@@ -828,6 +829,19 @@ fn safe_join(project_path: &str, rel: &str) -> Result<PathBuf, String> {
             Component::ParentDir | Component::Prefix(_) | Component::RootDir
         ) {
             return Err("Path traversal is not allowed".to_string());
+        }
+    }
+    // Reject aliases before canonicalization: a visible name must not reveal private state.
+    let mut component_path = root.clone();
+    for component in rel_path.components() {
+        component_path.push(component.as_os_str());
+        match fs::symlink_metadata(&component_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err("Symbolic links are not exposed by the local API".to_string());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err("Unable to verify project path".to_string()),
         }
     }
     let joined = root.join(rel_path);
@@ -1621,6 +1635,22 @@ struct SearchRequest {
     top_k: Option<usize>,
     include_content: Option<bool>,
     query_embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    local_only: bool,
+}
+
+async fn resolve_api_search_embedding(
+    request: &SearchRequest,
+    config: Option<commands::search::SearchEmbeddingConfig>,
+) -> Result<Option<Vec<f32>>, String> {
+    if request.local_only {
+        return Ok(None);
+    }
+    commands::search::resolve_query_embedding(
+        &request.query,
+        request.query_embedding.clone(),
+        config,
+    ).await
 }
 
 fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
@@ -1628,6 +1658,9 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
         Ok(project) => project,
         Err(e) => return err(404, e),
     };
+    if safe_join(&project.path, "wiki").is_err() {
+        return err(403, "Search root is not a safe project directory");
+    }
     let req: SearchRequest = match serde_json::from_str(body) {
         Ok(req) => req,
         Err(e) => return err(400, format!("Invalid JSON: {e}")),
@@ -1636,19 +1669,17 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
         return err(400, "query is required");
     }
     let top_k = req.top_k.unwrap_or(10).clamp(1, MAX_SEARCH_RESULTS);
-    let query = req.query;
     let query_embedding =
-        match tauri::async_runtime::block_on(commands::search::resolve_query_embedding(
-            &query,
-            req.query_embedding,
-            load_embedding_config(app),
+        match tauri::async_runtime::block_on(resolve_api_search_embedding(
+            &req,
+            if req.local_only { None } else { load_embedding_config(app) },
         )) {
             Ok(embedding) => embedding,
             Err(e) => return err(400, e),
         };
     match tauri::async_runtime::block_on(commands::search::search_project_inner(
         project.path.clone(),
-        query,
+        req.query,
         top_k,
         req.include_content.unwrap_or(false),
         query_embedding,
@@ -1657,6 +1688,7 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
             "ok": true,
             "projectId": project.id,
             "mode": search.mode,
+            "localOnly": req.local_only,
             "note": "Search uses the shared backend hybrid retrieval service, combining keyword, vector, and one-hop knowledge-graph candidates. When embeddingConfig is enabled, the API automatically includes LanceDB vector results; clients may also pass queryEmbedding explicitly.",
             "tokenHits": search.token_hits,
             "vectorHits": search.vector_hits,
@@ -2037,6 +2069,21 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[tokio::test]
+    async fn local_only_search_never_resolves_provider_or_explicit_embeddings() {
+        let request: SearchRequest = serde_json::from_str(
+            r#"{"query":"fixture","localOnly":true,"queryEmbedding":[]}"#,
+        ).unwrap();
+        // An empty explicit embedding fails normal validation; the local route must skip it.
+        assert!(resolve_api_search_embedding(&request, None).await.unwrap().is_none());
+        let legacy: SearchRequest = serde_json::from_str(
+            r#"{"query":"fixture","queryEmbedding":[0.25,0.75]}"#,
+        ).unwrap();
+        assert!(!legacy.local_only);
+        assert_eq!(resolve_api_search_embedding(&legacy, None).await.unwrap(), Some(vec![0.25,0.75]));
+        assert!(serde_json::from_str::<SearchRequest>(r#"{"query":"fixture","localOnly":"true"}"#).is_err());
+    }
+
     fn test_project_dir() -> PathBuf {
         // Per-process atomic sequence appended to the timestamp so two
         // tests calling this concurrently can't collide on the same dir
@@ -2061,6 +2108,25 @@ mod tests {
         assert!(safe_join(&root_str, "../secret.md").is_err());
         assert!(safe_join(&root_str, "wiki/../../secret.md").is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_symlinks_to_private_state_and_outside_files() {
+        use std::os::unix::fs::symlink;
+        let root = test_project_dir();
+        let outside = test_project_dir();
+        fs::create_dir_all(root.join(".llm-wiki")).unwrap();
+        fs::write(root.join(".llm-wiki/private.md"), "private fixture").unwrap();
+        fs::write(outside.join("outside.md"), "outside fixture").unwrap();
+        symlink(root.join(".llm-wiki/private.md"), root.join("wiki/public.md")).unwrap();
+        symlink(&outside, root.join("wiki/linked")).unwrap();
+        let root_str = root.to_string_lossy();
+        assert!(safe_join(&root_str, "wiki/public.md").is_err());
+        assert!(safe_join(&root_str, "wiki/linked/outside.md").is_err());
+        assert!(safe_join(&root_str, "wiki/linked/missing.md").is_err());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]
