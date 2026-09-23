@@ -117,3 +117,19 @@ test('validate scheduling, least privilege and explicit tests before publication
     if (step.uses) assert.match(step.uses, /@[a-f0-9]{40}$/);
   }
 });
+
+
+test('recreate the same commit in a fresh retry checkout after interrupted publication', () => {
+  const f = fixture();
+  const first = prepareCandidate(f);
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-wiki-upstream-retry-'));
+  git(cwd, 'init', '-b', 'main');
+  git(cwd, 'config', 'user.name', 'Update fixture');
+  git(cwd, 'config', 'user.email', 'fixture@example.invalid');
+  git(cwd, 'fetch', f.cwd, f.base, f.releaseSha);
+  git(cwd, 'checkout', '--detach', f.base);
+  const retry = prepareCandidate({ ...f, cwd, bundlePath: path.join(cwd, '..', path.basename(cwd) + '.bundle') });
+  assert.equal(retry.status, 'ready');
+  assert.equal(retry.head, first.head);
+  verifyCandidate(cwd, retry);
+});

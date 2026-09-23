@@ -8,8 +8,8 @@ const prefix = 'codex/upstream-';
 const stable = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const sha = /^[a-f0-9]{40}$/;
 
-function command(file, args, cwd = process.cwd()) {
-  return execFileSync(file, args, { cwd, encoding: 'utf8', timeout: 120_000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+function command(file, args, cwd = process.cwd(), extraEnv = {}) {
+  return execFileSync(file, args, { cwd, env: { ...process.env, ...extraEnv }, encoding: 'utf8', timeout: 120_000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 export function git(cwd, ...args) { return command('git', args, cwd); }
 function api(endpoint) { return JSON.parse(command('gh', ['api', endpoint])); }
@@ -44,7 +44,11 @@ export function prepareCandidate({ cwd, base, releaseSha, tag, pulls = [], bundl
   const previous = existingCandidate(pulls, branch);
   if (previous) return { ...previous, base, tag, releaseSha };
   git(cwd, 'switch', '-c', branch);
-  try { git(cwd, 'merge', '--no-ff', '--no-edit', releaseSha); }
+  // Fix merge metadata for the same two inputs so an interrupted publication
+  // can retry without producing another SHA or overwriting the existing branch.
+  const timestamp = Math.max(Number(git(cwd, 'show', '-s', '--format=%ct', base)), Number(git(cwd, 'show', '-s', '--format=%ct', releaseSha))) + 1;
+  const date = String(timestamp) + ' +0000';
+  try { command('git', ['merge', '--no-ff', '--no-edit', '-m', 'chore(upstream): integrate ' + tag, releaseSha], cwd, { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date }); }
   catch (error) {
     const conflicts = git(cwd, 'diff', '--name-only', '--diff-filter=U').split('\n').filter(Boolean);
     if (!conflicts.length) throw error;

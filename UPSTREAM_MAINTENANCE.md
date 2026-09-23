@@ -37,14 +37,14 @@ Retain reports and candidate bundles for 14 days. Use GitHub Actions failure not
 - Require the project's independent release review, packaged-app checks and approved source canaries before adoption. Test with disposable data first. Confirm the saved source watcher before launching; do not trigger unintended ingestion.
 - Merge only after acceptance. Use a normal merge, not a squash or rebase, so future ancestry checks recognize the upstream release. Keep the previous installed bundle available until the new version is accepted; do not rebuild over its linked release path during candidate testing.
 - If conflicts, workflow changes or failed tests stop automation, resolve them in an isolated checkout, rerun affected validation and open a reviewed candidate manually. Do not weaken guards to make the update pass.
-- If publication is interrupted after pushing but before PR creation, rerun. Reuse the identical branch; reject a changed branch. If a candidate was deliberately closed, handle any reconsideration manually instead of reopening it every week.
+- If publication is interrupted after pushing but before PR creation, rerun. Reproduce the same merge identifier from fixed input commits and metadata, reuse the identical branch, and reject a changed branch. If a candidate was deliberately closed, handle any reconsideration manually instead of reopening it every week.
 - Reconsider the fork only when all retained controls have suitable upstream equivalents and a tested migration preserves credentials, app identity and project data. Retire patches individually; do not abandon the fork merely because a newer version exists.
 
 ## Initial v0.6.11 candidate
 
 Preserve baseline `c91876300bb4a124bfd8a6d1bfe8ff371fc0d5c7` and integrate upstream `e8082119649e6a8e1cf85eaf289adcabfdf39d4e` (154 previously unintegrated commits). Retain the four scoped commits consolidating ingestion, CLI routing, MCP/API controls and app identity. Resolve merge conflicts without replacing the installed v0.6.4 application.
 
-Record the 2026-09-23 local validation: frontend build/typecheck PASS; 1,891 mock tests PASS; 30 MCP tests PASS; 404 native tests PASS, with two preexisting manual corpus probes ignored; seven update-safety tests PASS. Keep cloud-run status, packaged runtime and independent release review separate from local test results.
+Record the 2026-09-23 local validation: frontend build/typecheck PASS; 1,891 mock tests PASS; 30 MCP tests PASS; 404 native tests PASS, with two preexisting manual corpus probes ignored; eight update-safety tests PASS. Keep cloud-run status, packaged runtime and independent release review separate from local test results.
 
 Use the migration owner's existing completion plan for activation, pilot acceptance, source migration and legacy retirement. Do not duplicate those steps here or consider the old knowledge Favorite removable before that plan passes.
 
