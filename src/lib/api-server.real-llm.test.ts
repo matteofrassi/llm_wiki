@@ -378,7 +378,7 @@ describe.skipIf(!ENABLED)("local API v1 against real project", () => {
       )
       const effectiveToken = h.tokenSource === "env" ? apiToken : testToken
       if (!effectiveToken) {
-        console.warn("Skipping positive auth checks because the running app uses LLM_WIKI_API_TOKEN and apiToken was not provided.")
+        console.warn("Skipping positive auth checks because the running app uses LLM_WIKI_API_TOKEN and API_TOKEN was not provided.")
       }
 
       const noToken = await api<ApiEnvelope>("/api/v1/projects", {}, { auth: "none" })

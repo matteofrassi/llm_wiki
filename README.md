@@ -1,5 +1,7 @@
 # LLM Wiki
 
+> **Maintained macOS fork:** retain Keychain-backed credentials, startup protection and an authenticated seven-tool read-only MCP. Follow [fork maintenance and update acceptance](UPSTREAM_MAINTENANCE.md); treat broader upstream features described below as capabilities of the application/API, not permissions of this MCP profile.
+
 <p align="center">
   <img src="logo.jpg" width="128" height="128" style="border-radius: 22%;" alt="LLM Wiki Logo">
 </p>
