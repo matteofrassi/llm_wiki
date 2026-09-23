@@ -37,6 +37,7 @@ import { collectAllFilesIncludingDot } from "@/lib/sources-tree-delete"
 import { isPathAllowedBySourceWatch, normalizeSourceWatchConfig } from "@/lib/source-watch-config"
 import { isSensitiveConfigSourceFile } from "@/lib/source-filter"
 import { naturalCompare } from "@/lib/natural-sort"
+import { withProjectLock } from "@/lib/project-mutex"
 import type { SourceWatchConfig } from "@/stores/wiki-store"
 
 export const INGESTABLE_SOURCE_EXTENSIONS = new Set([
@@ -373,7 +374,8 @@ export async function deleteSourceFiles(
   options: { fileAlreadyDeleted?: boolean; logReason?: string } = {},
 ): Promise<DeleteSourcesResult> {
   const pp = normalizePath(projectPath)
-  const sourceInfos = sourcePaths
+  return withProjectLock(pp, async () => {
+    const sourceInfos = sourcePaths
     .map((sourcePath) => {
       const source = normalizePath(sourcePath)
       return {
@@ -384,9 +386,9 @@ export async function deleteSourceFiles(
     })
     .filter((info) => info.fileName.length > 0)
 
-  if (sourceInfos.length === 0) {
-    return { deletedWikiPaths: [], rewrittenSourcePages: 0, skippedPages: 0 }
-  }
+    if (sourceInfos.length === 0) {
+      return { deletedWikiPaths: [], rewrittenSourcePages: 0, skippedPages: 0 }
+    }
 
   const deletingNames = new Set(sourceInfos.map((info) => info.fileName.toLowerCase()))
   const deletingIdentities = new Set(
@@ -478,7 +480,8 @@ export async function deleteSourceFiles(
     )
   }
 
-  return { deletedWikiPaths, rewrittenSourcePages, skippedPages }
+    return { deletedWikiPaths, rewrittenSourcePages, skippedPages }
+  })
 }
 
 export async function deleteSourceFolder(

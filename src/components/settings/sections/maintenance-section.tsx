@@ -9,6 +9,7 @@ import {
   Trash2,
   RotateCcw,
   Clock,
+  RefreshCw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
@@ -16,6 +17,7 @@ import { useWikiStore } from "@/stores/wiki-store"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
 import { runDuplicateDetection } from "@/lib/dedup-runner"
 import { addNotDuplicate } from "@/lib/dedup-storage"
+import { rebuildWikiIndex } from "@/lib/ingest"
 import {
   enqueueMerge,
   cancelTask,
@@ -36,6 +38,11 @@ interface GroupUiEntry {
   skipped: boolean
 }
 
+interface IndexResult {
+  status: "success" | "error"
+  message: string
+}
+
 /** Match a card to its task in the queue (if any) by slug-set. */
 function findTaskForGroup(
   tasks: readonly DedupTask[],
@@ -54,6 +61,8 @@ export function MaintenanceSection() {
   const [scanError, setScanError] = useState<string | null>(null)
   const [groups, setGroups] = useState<GroupUiEntry[]>([])
   const [scanCompleted, setScanCompleted] = useState(false)
+  const [rebuildingIndex, setRebuildingIndex] = useState(false)
+  const [indexResult, setIndexResult] = useState<IndexResult | null>(null)
 
   // Poll the queue at 1Hz so the UI reflects pending → processing →
   // failed transitions and cross-window queue activity (e.g. a merge
@@ -73,6 +82,25 @@ export function MaintenanceSection() {
 
   const llmReady = hasUsableLlm(llmConfig)
   const projectReady = !!project
+
+  const handleRebuildIndex = useCallback(async () => {
+    if (!project) return
+    setRebuildingIndex(true)
+    setIndexResult(null)
+    try {
+      const changed = await rebuildWikiIndex(project.path)
+      setIndexResult({
+        status: "success",
+        message: changed
+          ? t("settings.sections.maintenance.index.rebuilt", { defaultValue: "Index rebuilt." })
+          : t("settings.sections.maintenance.index.upToDate", { defaultValue: "Index is already up to date." }),
+      })
+    } catch (err) {
+      setIndexResult({ status: "error", message: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setRebuildingIndex(false)
+    }
+  }, [project, t])
 
   const handleScan = useCallback(async () => {
     if (!project) return
@@ -221,6 +249,39 @@ export function MaintenanceSection() {
               "Tools for cleaning up the wiki — detect and merge duplicate entities/concepts that the LLM created under different names across re-ingests.",
           })}
         </p>
+      </div>
+
+      <div className="space-y-3 rounded-lg border border-border/60 bg-muted/20 p-4">
+        <div className="flex items-center gap-2">
+          <RefreshCw className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-semibold">
+            {t("settings.sections.maintenance.index.title", { defaultValue: "Rebuild wiki index" })}
+          </h3>
+        </div>
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          {t("settings.sections.maintenance.index.description", {
+            defaultValue:
+              "Rebuilds application-managed index categories from existing wiki pages. It does not re-ingest sources or call an LLM.",
+          })}
+        </p>
+        {!projectReady && (
+          <p className="text-xs text-amber-700 dark:text-amber-400">
+            {t("settings.sections.maintenance.noProject", {
+              defaultValue: "Open a project first.",
+            })}
+          </p>
+        )}
+        <Button onClick={() => void handleRebuildIndex()} disabled={rebuildingIndex || !projectReady}>
+          {rebuildingIndex ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+          {rebuildingIndex
+            ? t("settings.sections.maintenance.index.rebuilding", { defaultValue: "Rebuilding…" })
+            : t("settings.sections.maintenance.index.rebuildButton", { defaultValue: "Rebuild index" })}
+        </Button>
+        {indexResult && (
+          <p className={indexResult.status === "error" ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
+            {indexResult.message}
+          </p>
+        )}
       </div>
 
       <div className="space-y-3 rounded-lg border border-border/60 bg-muted/20 p-4">

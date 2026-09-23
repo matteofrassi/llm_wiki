@@ -31,6 +31,7 @@ import {
   canonicalizeSourcesField,
   isAppManagedAggregatePath,
   updateBoundedRecentIndexSection,
+  updateCategorizedIndexSections,
 } from "./ingest"
 
 // ── Happy paths ─────────────────────────────────────────────────────
@@ -680,5 +681,122 @@ describe("application-managed aggregate boundaries", () => {
     expect(recent.match(/^- \[\[/gm)).toHaveLength(200)
     expect(recent).toContain("[[new]]")
     expect(result).toContain("## Other\nKeep me")
+  })
+
+  it("catalogs pages by type while preserving custom index sections", () => {
+    const index = [
+      "# Wiki Index",
+      "",
+      "## Entities",
+      "",
+      "## Concepts",
+      "",
+      "## Custom Notes",
+      "Keep me unchanged",
+      "",
+      "## Recently Updated",
+      "- [[concepts/old]] — Old",
+      "",
+    ].join("\n")
+    const catalog = [
+      { target: "entities/gems", title: "Gems", type: "entity" },
+      { target: "concepts/llm-wiki", title: "LLM Wiki", type: "concept" },
+      { target: "sources/video", title: "Video", type: "source" },
+    ]
+
+    const result = updateCategorizedIndexSections(index, catalog)
+
+    expect(result).toContain("## Entities\n- [[entities/gems]] — Gems")
+    expect(result).toContain("## Concepts\n- [[concepts/llm-wiki]] — LLM Wiki")
+    expect(result).toContain("## Sources\n- [[sources/video]] — Video")
+    expect(result).toContain("## Custom Notes\nKeep me unchanged")
+    expect(result).toContain("## Recently Updated\n- [[concepts/old]] — Old")
+  })
+
+  it("is stable across repeated category rebuilds", () => {
+    const index = "# Wiki Index\n\n## Recently Updated\n"
+    const catalog = [{ target: "concepts/llm-wiki", title: "LLM Wiki", type: "concept" }]
+
+    const once = updateCategorizedIndexSections(index, catalog)
+    expect(updateCategorizedIndexSections(once, catalog)).toBe(once)
+  })
+
+  it("preserves indented custom sections after managed categories", () => {
+    const index = [
+      "# Wiki Index",
+      "",
+      "## Entities",
+      "",
+      "  ## Custom Notes",
+      "Keep me unchanged",
+      "",
+      "## Recently Updated",
+    ].join("\n")
+
+    const result = updateCategorizedIndexSections(index, [])
+
+    expect(result).toContain("  ## Custom Notes\nKeep me unchanged")
+    expect(result).toContain("## Recently Updated")
+  })
+
+  it("stops at an empty H2", () => {
+    const index = [
+      "# Wiki Index",
+      "",
+      "## Entities",
+      "stale entity",
+      "##",
+      "Keep this content",
+      "",
+      "## Recently Updated",
+    ].join("\n")
+
+    const result = updateCategorizedIndexSections(index, [
+      { target: "entities/gems", title: "Gems", type: "entity" },
+    ])
+
+    expect(result).toContain("## Entities\n- [[entities/gems]] — Gems")
+    expect(result).toContain("##\nKeep this content")
+  })
+
+  it("ignores H2-looking content inside custom-section code fences", () => {
+    const index = [
+      "# Wiki Index",
+      "",
+      "## Custom Notes",
+      "```markdown",
+      "## Entities",
+      "```",
+      "Keep this content",
+      "",
+      "## Recently Updated",
+    ].join("\n")
+
+    const result = updateCategorizedIndexSections(index, [])
+
+    expect(result).toContain("## Custom Notes\n```markdown\n## Entities\n```\nKeep this content")
+  })
+
+  it("does not close a code fence with a language-suffixed delimiter", () => {
+    const index = [
+      "# Wiki Index",
+      "",
+      "## Custom Notes",
+      "````markdown",
+      "## Entities",
+      "````typescript",
+      "## Still code",
+      "````",
+      "Keep this content",
+      "",
+      "## Recently Updated",
+    ].join("\n")
+
+    const result = updateCategorizedIndexSections(index, [])
+
+    expect(result).toContain(
+      "## Custom Notes\n````markdown\n## Entities\n````typescript\n## Still code\n````\nKeep this content",
+    )
+    expect(result).toContain("## Recently Updated")
   })
 })

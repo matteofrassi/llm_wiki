@@ -440,4 +440,128 @@ describe("ingest scenarios (fixture-driven)", () => {
       detail: "Ingest cancelled",
     })
   })
+
+  it("adds deterministic detail when the model emits a heading-only ingest log", async () => {
+    ctx = { tmp: await createTempProject("ingest-heading-only-log") }
+    const projectPath = ctx.tmp.path
+
+    await writeFileRaw(`${projectPath}/schema.md`, "")
+    await writeFileRaw(`${projectPath}/purpose.md`, "")
+    await writeFileRaw(`${projectPath}/wiki/index.md`, "# Wiki Index\n")
+    await writeFileRaw(`${projectPath}/wiki/overview.md`, "")
+    await writeFileRaw(`${projectPath}/wiki/log.md`, "# Research Log\n\n## Historical entry\n\n- Keep me.\n")
+    await writeFileRaw(`${projectPath}/raw/sources/log-fallback.md`, "source")
+
+    useWikiStore.setState({
+      project: {
+        name: "t",
+        path: projectPath,
+        createdAt: 0,
+        purposeText: "",
+        fileTree: [],
+      } as unknown as ReturnType<typeof useWikiStore.getState>["project"],
+    })
+    useWikiStore.getState().setLlmConfig({
+      provider: "openai",
+      apiKey: "test-key",
+      model: "gpt-4",
+      ollamaUrl: "",
+      customEndpoint: "",
+      maxContextSize: 128000,
+    })
+    pendingResponses = [
+      "analysis",
+      [
+        "---FILE: wiki/sources/log-fallback.md---",
+        "---",
+        "type: source",
+        "title: Source: log-fallback.md",
+        "sources: [log-fallback.md]",
+        "tags: []",
+        "related: []",
+        "---",
+        "",
+        "# Source: log-fallback.md",
+        "---END FILE---",
+        "",
+        "---FILE: wiki/log.md---",
+        "## 2026-07-18 ingest | Heading only",
+        "---END FILE---",
+        "",
+        "---FILE: wiki/log.md---",
+        "## 2026-07-18 ingest | Heading only",
+        "---END FILE---",
+      ].join("\n"),
+    ]
+
+    await autoIngest(
+      projectPath,
+      `${projectPath}/raw/sources/log-fallback.md`,
+      useWikiStore.getState().llmConfig,
+    )
+
+    const log = await readFileRaw(`${projectPath}/wiki/log.md`)
+    expect(log).toContain("## Historical entry\n\n- Keep me.")
+    expect(log).toMatch(/## \d{4}-\d{2}-\d{2} ingest \| Heading only/)
+    expect((log.match(/## \d{4}-\d{2}-\d{2} ingest \| Heading only/g) ?? [])).toHaveLength(1)
+    expect(log).toContain("- Processed source: `log-fallback.md`.")
+    expect(log).toContain("- Source summary: [[sources/")
+  })
+
+  it("appends a deterministic log entry when the model omits the log block", async () => {
+    ctx = { tmp: await createTempProject("ingest-missing-log") }
+    const projectPath = ctx.tmp.path
+
+    await writeFileRaw(`${projectPath}/schema.md`, "")
+    await writeFileRaw(`${projectPath}/purpose.md`, "")
+    await writeFileRaw(`${projectPath}/wiki/index.md`, "# Wiki Index\n")
+    await writeFileRaw(`${projectPath}/wiki/overview.md`, "")
+    await writeFileRaw(`${projectPath}/wiki/log.md`, "# Research Log\n")
+    await writeFileRaw(`${projectPath}/raw/sources/missing-log.md`, "source")
+
+    useWikiStore.setState({
+      project: {
+        name: "t",
+        path: projectPath,
+        createdAt: 0,
+        purposeText: "",
+        fileTree: [],
+      } as unknown as ReturnType<typeof useWikiStore.getState>["project"],
+    })
+    useWikiStore.getState().setLlmConfig({
+      provider: "openai",
+      apiKey: "test-key",
+      model: "gpt-4",
+      ollamaUrl: "",
+      customEndpoint: "",
+      maxContextSize: 128000,
+    })
+    pendingResponses = [
+      "analysis",
+      [
+        "---FILE: wiki/sources/missing-log.md---",
+        "---",
+        "type: source",
+        "title: Source: missing-log.md",
+        "sources: [missing-log.md]",
+        "tags: []",
+        "related: []",
+        "---",
+        "",
+        "# Source: missing-log.md",
+        "---END FILE---",
+      ].join("\n"),
+      "",
+    ]
+
+    await autoIngest(
+      projectPath,
+      `${projectPath}/raw/sources/missing-log.md`,
+      useWikiStore.getState().llmConfig,
+    )
+
+    const log = await readFileRaw(`${projectPath}/wiki/log.md`)
+    expect(log).toMatch(/## \d{4}-\d{2}-\d{2} ingest \| missing-log/)
+    expect(log).toContain("- Processed source: `missing-log.md`.")
+  })
 })

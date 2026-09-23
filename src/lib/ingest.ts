@@ -39,7 +39,7 @@ import {
 } from "@/lib/extract-source-images"
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
 import type { MultimodalConfig } from "@/stores/wiki-store"
-import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
+import { GENERATION_WIKI_TYPES, inferWikiTypeFromPath } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 
@@ -56,6 +56,25 @@ const INGEST_GENERATION_TOKENS_512K = 32_768
 const REVIEW_STAGE_MIN_SIGNAL_CHARS = 10_000
 const REVIEW_STAGE_MIN_FILE_BLOCKS = 4
 const AGGREGATE_WIKI_PATHS = ["wiki/index.md", "wiki/overview.md", "wiki/log.md"] as const
+const MARKDOWN_H2 = /^ {0,3}##(?:[ \t]+(.*)|[ \t]*)$/
+
+const WIKI_INDEX_SECTIONS = [
+  { type: "entity", heading: "Entities" },
+  { type: "concept", heading: "Concepts" },
+  { type: "source", heading: "Sources" },
+  { type: "query", heading: "Queries" },
+  { type: "comparison", heading: "Comparisons" },
+  { type: "synthesis", heading: "Synthesis" },
+  { type: "finding", heading: "Findings" },
+  { type: "thesis", heading: "Thesis" },
+  { type: "methodology", heading: "Methodology" },
+] as const
+
+export interface WikiIndexEntry {
+  target: string
+  title: string
+  type: string
+}
 
 function appendSavedImageRefsForCaption(content: string, images: SavedImage[]): string {
   if (images.length === 0) return content
@@ -1240,6 +1259,13 @@ async function autoIngestImpl(
     }
   }
 
+  if (!writtenPaths.some((path) => normalizePath(path) === "wiki/log.md") && !signal?.aborted) {
+    throwIfIngestAborted(signal, activityId)
+    await appendDeterministicIngestLogEntry(pp, sourceIdentity, sourceSummaryPath, currentWikiDate())
+    writtenPaths.push("wiki/log.md")
+    onFileWritten?.("wiki/log.md")
+  }
+
   // ── Step 3.5: Append extracted images to the source-summary page ─
   // Skipped when the master toggle is off — see Step 0.6 above for
   // the full rationale. With captioning disabled we also don't
@@ -1441,15 +1467,10 @@ async function updateWikiIndexDeterministically(
   if (candidates.length === 0) return false
 
   const indexPath = `${projectPath}/wiki/index.md`
-  const index = await readFile(indexPath).catch(() => "# Wiki Index\n")
-  const knownTargets = new Set(
-    Array.from(index.matchAll(/\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]/g))
-      .map((match) => normalizeIndexTarget(match[1])),
-  )
+  const index = await readWikiIndex(indexPath)
   const additions: string[] = []
   for (const path of candidates) {
     const target = path.replace(/^wiki\//, "").replace(/\.md$/i, "")
-    if (knownTargets.has(normalizeIndexTarget(target))) continue
     const content = await readFile(`${projectPath}/${path}`).catch(() => "")
     const parsed = parseFrontmatter(content)
     const title = typeof parsed.frontmatter?.title === "string"
@@ -1457,10 +1478,71 @@ async function updateWikiIndexDeterministically(
       : getFileName(path).replace(/\.md$/i, "")
     additions.push(`- [[${target}]] — ${title}`)
   }
-  if (additions.length === 0) return false
+  const catalog = await collectWikiIndexEntries(projectPath)
+  const updated = updateBoundedRecentIndexSection(
+    updateCategorizedIndexSections(index, catalog),
+    additions,
+  )
+  if (updated === index) return false
 
-  await writeFile(indexPath, updateBoundedRecentIndexSection(index, additions))
+  await writeFile(indexPath, updated)
   return true
+}
+
+/** Rebuild application-managed index sections without invoking an LLM. */
+export async function rebuildWikiIndex(projectPath: string): Promise<boolean> {
+  return withProjectLock(normalizePath(projectPath), async () => {
+    const indexPath = `${projectPath}/wiki/index.md`
+    const index = await readWikiIndex(indexPath)
+    const updated = updateCategorizedIndexSections(index, await collectWikiIndexEntries(projectPath))
+    if (updated === index) return false
+    await writeFile(indexPath, updated)
+    return true
+  })
+}
+
+async function readWikiIndex(indexPath: string): Promise<string> {
+  return (await fileExists(indexPath)) ? readFile(indexPath) : "# Wiki Index\n"
+}
+
+async function collectWikiIndexEntries(projectPath: string): Promise<WikiIndexEntry[]> {
+  const wikiRoot = normalizePath(`${projectPath}/wiki`).replace(/\/+$/, "")
+  const nodes = await listDirectory(wikiRoot)
+  const files: FileNode[] = []
+  const visit = (items: FileNode[]) => {
+    for (const item of items) {
+      if (item.is_dir) {
+        if (item.children) visit(item.children)
+      } else if (item.name.toLowerCase().endsWith(".md")) {
+        files.push(item)
+      }
+    }
+  }
+  visit(nodes)
+
+  const knownTypes = new Set<string>(WIKI_INDEX_SECTIONS.map((section) => section.type))
+  const entries: WikiIndexEntry[] = []
+  for (const file of files) {
+    const path = normalizePath(file.path)
+    if (!path.startsWith(`${wikiRoot}/`)) continue
+    const relative = `wiki/${path.slice(wikiRoot.length + 1)}`
+    if (AGGREGATE_WIKI_PATHS.includes(relative as (typeof AGGREGATE_WIKI_PATHS)[number])) continue
+    const type = inferWikiTypeFromPath(relative, file.name)
+    if (!type || !knownTypes.has(type)) continue
+    const content = await readFile(path)
+    const parsed = parseFrontmatter(content)
+    const title = typeof parsed.frontmatter?.title === "string" && parsed.frontmatter.title.trim()
+      ? parsed.frontmatter.title.trim()
+      : file.name.replace(/\.md$/i, "")
+    entries.push({
+      target: relative.replace(/^wiki\//, "").replace(/\.md$/i, ""),
+      title,
+      type,
+    })
+  }
+  return entries.sort((left, right) =>
+    normalizeIndexTarget(left.target).localeCompare(normalizeIndexTarget(right.target)),
+  )
 }
 
 function normalizeIndexTarget(target: string): string {
@@ -1473,17 +1555,83 @@ function normalizeIndexTarget(target: string): string {
 export function updateBoundedRecentIndexSection(index: string, additions: string[]): string {
   const section = "## Recently Updated"
   const lines = index.trimEnd().split("\n")
-  const start = lines.findIndex((line) => line.trim() === section)
+  const start = findIndexHeading(lines, section.slice(3))
   const prefix = start >= 0 ? lines.slice(0, start) : lines
-  const sectionEnd = start >= 0
-    ? lines.findIndex((line, position) => position > start && /^##\s+/.test(line))
-    : -1
+  const sectionEnd = start >= 0 ? findIndexHeading(lines, undefined, start + 1) : -1
   const existing = start >= 0
     ? lines.slice(start + 1, sectionEnd >= 0 ? sectionEnd : undefined).filter((line) => /^-\s+/.test(line))
     : []
   const suffix = sectionEnd >= 0 ? lines.slice(sectionEnd) : []
-  const recent = Array.from(new Set([...additions, ...existing])).slice(0, 200)
+  const recent = dedupeIndexEntries([...additions, ...existing]).slice(0, 200)
   return [...prefix, "", section, ...recent, ...(suffix.length ? ["", ...suffix] : []), ""].join("\n")
+}
+
+export function updateCategorizedIndexSections(index: string, catalog: WikiIndexEntry[]): string {
+  let updated = index.trimEnd() || "# Wiki Index"
+  for (const section of WIKI_INDEX_SECTIONS) {
+    const entries = catalog
+      .filter((entry) => entry.type === section.type)
+      .map((entry) => `- [[${entry.target}]] — ${entry.title}`)
+    updated = replaceIndexSection(updated, section.heading, entries)
+  }
+  return `${updated.trimEnd()}\n`
+}
+
+function replaceIndexSection(index: string, heading: string, entries: string[]): string {
+  const section = `## ${heading}`
+  const lines = index.trimEnd().split("\n")
+  const start = findIndexHeading(lines, heading)
+  const end = start >= 0 ? findIndexHeading(lines, undefined, start + 1) : -1
+  const replacement = [section, ...entries, ""]
+  if (start >= 0) {
+    return [...lines.slice(0, start), ...replacement, ...lines.slice(end >= 0 ? end : undefined)].join("\n")
+  }
+  const recent = findIndexHeading(lines, "Recently Updated")
+  const insertion = recent >= 0 ? recent : lines.length
+  const prefix = lines.slice(0, insertion)
+  const suffix = lines.slice(insertion)
+  return [
+    ...prefix,
+    ...(prefix[prefix.length - 1] === "" ? [] : [""]),
+    ...replacement,
+    ...suffix,
+  ].join("\n")
+}
+
+function findIndexHeading(lines: string[], expected?: string, from = 0): number {
+  let fence: { character: "`" | "~"; length: number } | null = null
+  for (let position = 0; position < lines.length; position++) {
+    const line = lines[position]
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/)
+    if (fenceMatch) {
+      const marker = fenceMatch[1]
+      if (!fence) {
+        fence = { character: marker[0] as "`" | "~", length: marker.length }
+      } else if (
+        marker[0] === fence.character
+        && marker.length >= fence.length
+        && /^[ \t]*$/.test(fenceMatch[2])
+      ) {
+        fence = null
+      }
+      continue
+    }
+    if (fence || position < from) continue
+    const match = line.match(MARKDOWN_H2)
+    if (match && (expected === undefined || (match[1] ?? "").trim() === expected)) return position
+  }
+  return -1
+}
+
+function dedupeIndexEntries(entries: string[]): string[] {
+  const seen = new Set<string>()
+  return entries.filter((entry) => {
+    const match = entry.match(/\[\[([^\]|#]+)/)
+    const key = match ? normalizeIndexTarget(match[1]) : entry
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 export function filterAggregateRepairOutput(text: string, allowedPaths: string[]): {
@@ -1772,6 +1920,58 @@ export function stampGeneratedLogDate(content: string, date: string): string {
   return normalized
 }
 
+function buildDeterministicIngestLogEntry(
+  sourceIdentity: string,
+  sourceSummaryPath: string | undefined,
+  date: string,
+  heading?: string,
+): string {
+  const sourceName = getFileName(sourceIdentity).replace(/\.[^.]+$/, "") || sourceIdentity
+  const safeSource = sourceIdentity.replace(/[\r\n`]/g, " ").trim()
+  const rawSummaryTarget = sourceSummaryPath
+    ?.replace(/^wiki\//, "")
+    .replace(/\.md$/i, "")
+  const summaryTarget = rawSummaryTarget && !/[\[\]#|]/.test(rawSummaryTarget)
+    ? rawSummaryTarget
+    : undefined
+  const title = heading || `## ${date} ingest | ${sourceName}`
+  return [
+    title,
+    "",
+    `- Processed source: \`${safeSource}\`.`,
+    ...(summaryTarget ? [`- Source summary: [[${summaryTarget}]].`] : []),
+  ].join("\n")
+}
+
+function completeIngestLogEntry(
+  content: string,
+  sourceIdentity: string,
+  sourceSummaryPath: string | undefined,
+  date: string,
+): string {
+  const stamped = stampGeneratedLogDate(content, date).trim()
+  const heading = stamped.match(/^##\s+[^\r\n]+$/m)
+  if (!heading) {
+    return buildDeterministicIngestLogEntry(sourceIdentity, sourceSummaryPath, date)
+  }
+  const body = stamped.slice((heading.index ?? 0) + heading[0].length).trim()
+  return body
+    ? stamped
+    : buildDeterministicIngestLogEntry(sourceIdentity, sourceSummaryPath, date, heading[0])
+}
+
+async function appendDeterministicIngestLogEntry(
+  projectPath: string,
+  sourceIdentity: string,
+  sourceSummaryPath: string,
+  date: string,
+): Promise<void> {
+  const logPath = `${projectPath}/wiki/log.md`
+  const existing = await fileExists(logPath) ? await readFile(logPath) : "# Research Log\n"
+  const entry = buildDeterministicIngestLogEntry(sourceIdentity, sourceSummaryPath, date)
+  await writeFile(logPath, `${existing.trimEnd()}\n\n${entry}\n`)
+}
+
 function setOrAppendFrontmatterDate(payload: string, key: "created" | "updated", date: string): string {
   const lineRe = new RegExp(`(^|\\n)(${key}\\s*:\\s*)[^\\n\\r]*`, "i")
   if (lineRe.test(payload)) {
@@ -1793,6 +1993,7 @@ async function writeFileBlocks(
   const { blocks, warnings: parseWarnings } = parseFileBlocks(text)
   const warnings = [...parseWarnings]
   const writtenPaths: string[] = []
+  const writtenLogEntries = new Set<string>()
   // "Hard failures" = blocks we INTENDED to write but the FS rejected
   // (disk full, permission, OS-level errors). Distinct from soft drops
   // (language mismatch, parse warnings, path-traversal rejections):
@@ -1830,7 +2031,13 @@ async function writeFileBlocks(
     // paper over it forever.
     let content = sanitizeIngestedFileContent(rawContent)
     if (isLogPath(relativePath)) {
-      content = stampGeneratedLogDate(content, today)
+      content = completeIngestLogEntry(content, sourceFileName, sourceSummaryPath, today)
+      const logKey = content.trim()
+      if (writtenLogEntries.has(logKey)) {
+        warnings.push("Ignored duplicate model log entry.")
+        continue
+      }
+      writtenLogEntries.add(logKey)
     } else if (!isListingPath(relativePath)) {
       content = stampGeneratedFrontmatterDates(content, today)
     }
