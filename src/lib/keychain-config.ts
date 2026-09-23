@@ -67,6 +67,15 @@ function moveProviderKeys(
   for (const [provider, value] of Object.entries(providers as StoredConfig)) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue
     moveString(config, `${path}.${provider}.apiKey`, secrets, includeEmpty)
+    moveHeaders(config, `${path}.${provider}.customHeaders`, secrets, includeEmpty)
+  }
+}
+
+function moveHeaders(config: StoredConfig, path: string, secrets: Record<string, string>, includeEmpty: boolean): void {
+  const headers = getAtPath(config, path.split("."))
+  if (headers && typeof headers === "object" && !Array.isArray(headers) && (includeEmpty || Object.keys(headers).length > 0)) {
+    secrets[path] = JSON.stringify(headers)
+    setAtPath(config, path.split("."), {})
   }
 }
 
@@ -78,11 +87,8 @@ export function redactConfigSecrets(input: StoredConfig, includeEmpty: boolean =
   moveProviderKeys(config, "providerConfigs", secrets, includeEmpty)
   moveProviderKeys(config, "searchApiConfig.providerConfigs", secrets, includeEmpty)
 
-  const headers = getAtPath(config, ["embeddingConfig", "extraHeaders"])
-  if (headers && typeof headers === "object" && !Array.isArray(headers) && (includeEmpty || Object.keys(headers).length > 0)) {
-    secrets["embeddingConfig.extraHeaders"] = JSON.stringify(headers)
-    setAtPath(config, ["embeddingConfig", "extraHeaders"], {})
-  }
+  moveHeaders(config, "embeddingConfig.extraHeaders", secrets, includeEmpty)
+  moveHeaders(config, "llmConfig.customHeaders", secrets, includeEmpty)
 
   return { config, secrets }
 }
@@ -90,7 +96,7 @@ export function redactConfigSecrets(input: StoredConfig, includeEmpty: boolean =
 export function restoreConfigSecrets(input: StoredConfig, secrets: Record<string, string>): StoredConfig {
   const config = cloneConfig(input)
   for (const [path, value] of Object.entries(secrets)) {
-    if (path === "embeddingConfig.extraHeaders") {
+    if (path === "embeddingConfig.extraHeaders" || path.endsWith(".customHeaders")) {
       try {
         setAtPath(config, path.split("."), JSON.parse(value))
       } catch {

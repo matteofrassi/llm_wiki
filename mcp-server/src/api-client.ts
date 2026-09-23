@@ -4,6 +4,7 @@ export interface LlmWikiApiClientOptions {
   baseUrl?: string
   token?: string
   fetchImpl?: typeof fetch
+  timeoutMs?: number
 }
 
 export interface ApiProject {
@@ -35,6 +36,15 @@ export interface ApiSearchResponse {
   mode?: string
   tokenHits?: number
   vectorHits?: number
+}
+
+export interface ApiPageEmbeddingResult {
+  path: string
+  pageId: string
+  revision: string
+  chunks: number
+  vectorsWritten: number
+  status: string
 }
 
 export interface ApiChatReference {
@@ -139,7 +149,11 @@ export interface ApiHealth {
 
 export function normalizeBaseUrl(value?: string): string {
   const raw = (value ?? DEFAULT_API_BASE_URL).trim() || DEFAULT_API_BASE_URL
-  return raw.replace(/\/+$/, "")
+  if (!/^http:\/\/(127\.0\.0\.1|localhost)(:\d{1,5})?\/*$/.test(raw)) throw new Error("LLM Wiki requires an HTTP loopback origin")
+  const url = new URL(raw)
+  if (url.port === "0") throw new Error("Invalid loopback port")
+  url.hostname = "127.0.0.1"
+  return url.origin
 }
 
 function apiPath(path: string): string {
@@ -157,15 +171,32 @@ function numberOrUndefined(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
+function requireString(value: unknown, context: string): string {
+  if (typeof value !== "string" || !value) {
+    throw new Error(`${context}: expected non-empty string`)
+  }
+  return value
+}
+
+function requireNumber(value: unknown, context: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${context}: expected finite number`)
+  }
+  return value
+}
+
 export class LlmWikiApiClient {
   private readonly baseUrl: string
   private readonly token?: string
   private readonly fetchImpl: typeof fetch
+  private readonly timeoutMs: number
 
   constructor(options: LlmWikiApiClientOptions = {}) {
     this.baseUrl = normalizeBaseUrl(options.baseUrl ?? process.env.LLM_WIKI_API_BASE_URL)
     this.token = options.token ?? process.env.LLM_WIKI_API_TOKEN
     this.fetchImpl = options.fetchImpl ?? fetch
+    this.timeoutMs = options.timeoutMs ?? 30_000
+    if (!Number.isInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 30_000) throw new Error("Invalid request timeout")
   }
 
   async health(): Promise<ApiHealth> {
@@ -216,13 +247,14 @@ export class LlmWikiApiClient {
     }
   }
 
-  async search(projectId = "current", query: string, options: { topK?: number; includeContent?: boolean } = {}): Promise<ApiSearchResponse> {
+  async search(projectId = "current", query: string, options: { topK?: number; includeContent?: boolean; localOnly?: boolean } = {}): Promise<ApiSearchResponse> {
     const json = await this.request(`/projects/${encodeURIComponent(projectId)}/search`, {
       method: "POST",
       body: {
         query,
         topK: options.topK,
         includeContent: options.includeContent,
+        localOnly: options.localOnly,
       },
     })
     return {
@@ -296,38 +328,66 @@ export class LlmWikiApiClient {
     })
   }
 
+  async embedPage(path: string, projectId = "current", force = false): Promise<ApiPageEmbeddingResult> {
+    const json = await this.request(`/projects/${encodeURIComponent(projectId)}/pages/embed`, {
+      method: "POST",
+      body: { path, force },
+    })
+    const result = requireObject(json.result, "page embedding result")
+    return {
+      path: requireString(result.path, "page embedding result.path"),
+      pageId: requireString(result.pageId, "page embedding result.pageId"),
+      revision: requireString(result.revision, "page embedding result.revision"),
+      chunks: requireNumber(result.chunks, "page embedding result.chunks"),
+      vectorsWritten: requireNumber(result.vectorsWritten, "page embedding result.vectorsWritten"),
+      status: requireString(result.status, "page embedding result.status"),
+    }
+  }
+
   private async request(path: string, options: { method?: "GET" | "POST"; body?: unknown; auth?: boolean } = {}): Promise<Record<string, unknown>> {
     const url = `${this.baseUrl}${apiPath(path)}`
     const headers: Record<string, string> = { Accept: "application/json" }
+    if (options.auth !== false && !this.token?.trim()) throw new Error("LLM Wiki API token is missing; use the approved Keychain launcher")
     if (options.auth !== false && this.token?.trim()) {
       headers.Authorization = `Bearer ${this.token.trim()}`
     }
     if (options.body !== undefined) headers["Content-Type"] = "application/json"
 
-    let response: Response
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    const deadline = new Promise<never>((_, reject) => controller.signal.addEventListener("abort", () => reject(new Error("LLM Wiki API request timed out")), { once: true }))
     try {
-      response = await this.fetchImpl(url, {
+      const response = await Promise.race([this.fetchImpl(url, {
         method: options.method ?? (options.body === undefined ? "GET" : "POST"),
         headers,
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      })
-    } catch (err) {
-      throw new Error(`LLM Wiki API request failed. Is the desktop app running? ${err instanceof Error ? err.message : String(err)}`)
-    }
-
-    const text = await response.text()
-    let json: Record<string, unknown>
-    try {
-      json = text ? requireObject(JSON.parse(text), "LLM Wiki API response") : {}
-    } catch (err) {
-      throw new Error(`LLM Wiki API returned non-JSON response (${response.status}): ${text.slice(0, 300)}${err instanceof Error ? ` (${err.message})` : ""}`)
-    }
-
-    if (!response.ok || json.ok === false) {
-      const message = typeof json.error === "string" ? json.error : response.statusText
-      throw new Error(`LLM Wiki API ${response.status}: ${message}`)
-    }
-    return json
+        redirect: "error",
+        signal: controller.signal,
+      }), deadline])
+      if (!response.ok) { void response.body?.cancel(); throw new Error(`LLM Wiki API HTTP ${response.status}`) }
+      const reader = response.body?.getReader()
+      const chunks: Uint8Array[] = []
+      let size = 0
+      try {
+        if (Number(response.headers.get("content-length")) > 2_000_000) throw new Error("LLM Wiki API response exceeds the size limit")
+        if (reader) while (true) {
+          const {done,value} = await Promise.race([reader.read(), deadline])
+          if (done) break
+          size += value.byteLength
+          if (size > 2_000_000) throw new Error("LLM Wiki API response exceeds the size limit")
+          chunks.push(value)
+        }
+      } finally { if (reader) { void reader.cancel().catch(() => {}); reader.releaseLock() } }
+      let json: Record<string, unknown>
+      try { json = requireObject(JSON.parse(Buffer.concat(chunks).toString("utf8")), "response") }
+      catch { throw new Error("LLM Wiki API returned invalid JSON") }
+      if (json.ok === false) throw new Error("LLM Wiki API rejected the request")
+      return json
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error("LLM Wiki API request timed out")
+      if (error instanceof Error && /^LLM Wiki API (HTTP \d{3}|response exceeds the size limit|returned invalid JSON|rejected the request)$/.test(error.message)) throw error
+      throw new Error("LLM Wiki API request failed. Is the desktop app running?")
+    } finally { clearTimeout(timer) }
   }
 }
 

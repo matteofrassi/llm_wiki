@@ -76,3 +76,25 @@ describe("keychain-config", () => {
     ])
   })
 })
+
+describe("upstream custom-header credentials", () => {
+  it("redacts and restores global and per-provider headers without mutating input", () => {
+    const input = {
+      llmConfig: { model: "fixture", customHeaders: { Authorization: "fixture" } },
+      providerConfigs: { "custom-example": { apiKey: "fixture", customHeaders: { "X-Credential": "fixture" } } },
+    }
+    const { config, secrets } = redactConfigSecrets(input)
+    expect(config).toEqual({ llmConfig: { model: "fixture", customHeaders: {} }, providerConfigs: { "custom-example": { apiKey: "", customHeaders: {} } } })
+    expect(restoreConfigSecrets(config, secrets)).toEqual(input)
+    expect(plaintextSecretPaths(input)).toContain("llmConfig.customHeaders")
+    expect(plaintextSecretPaths(input)).toContain("providerConfigs.custom-example.customHeaders")
+    expect(plaintextSecretPaths(config)).toEqual([])
+    expect(input.llmConfig.customHeaders.Authorization).toBe("fixture")
+  })
+
+  it("preserves redacted headers on load and represents explicit user clearing", () => {
+    const input = { llmConfig: { customHeaders: {} } }
+    expect(redactConfigSecrets(input, false).secrets).toEqual({})
+    expect(redactConfigSecrets(input).secrets).toEqual({ "llmConfig.customHeaders": "{}" })
+  })
+})

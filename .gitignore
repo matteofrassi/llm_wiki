@@ -18,8 +18,7 @@ src-tauri/gen/
 
 # Environment files
 .env
-.env.local
-.env.*.local
+.env.*
 
 # Internal docs (not shipped)
 docs/

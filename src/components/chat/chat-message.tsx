@@ -10,6 +10,7 @@ import {
   Bot, User, FileText, BookmarkPlus, ChevronDown, ChevronRight, RefreshCw, Copy, Check,
   Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, Layout, Globe,
   TrendingUp, Target, Sparkles, Image as ImageIcon, FileSearch, Terminal,
+  ListTree,
 } from "lucide-react"
 import { openUrl } from "@tauri-apps/plugin-opener"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -22,6 +23,7 @@ import { convertLatexToUnicode } from "@/lib/latex-to-unicode"
 import { normalizePath, getFileName, isAbsolutePath } from "@/lib/path-utils"
 import { makeQueryFileName } from "@/lib/wiki-filename"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
+import { getTaskLlmConfig } from "@/lib/llm-task-routing"
 import { messageImageToDataUrl } from "@/lib/chat-image-utils"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
 import { transformImageEmbeds } from "@/lib/wikilink-transform"
@@ -77,6 +79,7 @@ interface ChatMessageProps {
   isLastAssistant?: boolean
   onRegenerate?: () => void
   onOpenReferencePreview?: (preview: ChatReferencePreview, relatedPreviews?: ChatReferencePreview[]) => void
+  onOpenContextDetails?: (references: MessageReference[]) => void
   onApproveShellCommand?: (command: string, assistantMessageId: string) => void
   onSubmitUserInput?: (request: ChatUserInputRequest, answers: Record<string, unknown>) => boolean
 }
@@ -95,9 +98,11 @@ function ChatMessageImpl({
   isLastAssistant,
   onRegenerate,
   onOpenReferencePreview,
+  onOpenContextDetails,
   onApproveShellCommand,
   onSubmitUserInput,
 }: ChatMessageProps) {
+  const { t } = useTranslation()
   const isUser = message.role === "user"
   const isSystem = message.role === "system"
   const isAssistant = message.role === "assistant"
@@ -179,6 +184,7 @@ function ChatMessageImpl({
             content={message.content}
             savedReferences={message.references}
             onOpenReferencePreview={onOpenReferencePreview}
+            onOpenContextDetails={onOpenContextDetails}
           />
         )}
         {isAssistant && message.userInputRequest && (
@@ -196,9 +202,9 @@ function ChatMessageImpl({
                 type="button"
                 onClick={onRegenerate}
                 className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
-                title="Regenerate this response"
+                title={t("chat.regenerateResponse")}
               >
-                <RefreshCw className="h-3 w-3" /> Regenerate
+                <RefreshCw className="h-3 w-3" /> {t("chat.regenerate")}
               </button>
             )}
           </div>
@@ -509,6 +515,7 @@ function initialUserInputAnswers(request: ChatUserInputRequest): Record<string, 
 }
 
 function CopyButton({ content }: { content: string }) {
+  const { t } = useTranslation()
   const [copied, setCopied] = useState(false)
 
   const handleCopy = useCallback(async () => {
@@ -529,15 +536,16 @@ function CopyButton({ content }: { content: string }) {
       type="button"
       onClick={handleCopy}
       className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
-      title="Copy to clipboard"
+      title={t("chat.copyToClipboard")}
     >
       {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-      {copied ? "Copied!" : "Copy"}
+      {copied ? t("chat.copied") : t("chat.copy")}
     </button>
   )
 }
 
 function SaveToWikiButton({ content, visible }: { content: string; visible: boolean }) {
+  const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const [saved, setSaved] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -609,7 +617,7 @@ function SaveToWikiButton({ content, visible }: { content: string; visible: bool
       setTimeout(() => setSaved(false), 2000)
 
       // Full auto-ingest: extract entities, concepts, cross-references from saved content
-      const llmConfig = useWikiStore.getState().llmConfig
+      const llmConfig = getTaskLlmConfig("ingest")
       if (hasUsableLlm(llmConfig)) {
         const { autoIngest } = await import("@/lib/ingest")
         autoIngest(pp, filePath, llmConfig).catch((err) =>
@@ -631,10 +639,10 @@ function SaveToWikiButton({ content, visible }: { content: string; visible: bool
       onClick={handleSave}
       disabled={saving}
       className="self-start inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
-      title="Save to wiki"
+      title={t("chat.saveToWiki")}
     >
       <BookmarkPlus className="h-3 w-3" />
-      {saved ? "Saved!" : saving ? "Saving..." : "Save to Wiki"}
+      {saved ? t("chat.saved") : saving ? t("chat.saving") : t("chat.saveToWiki")}
     </button>
   )
 }
@@ -745,10 +753,12 @@ function CitedReferencesPanel({
   content,
   savedReferences,
   onOpenReferencePreview,
+  onOpenContextDetails,
 }: {
   content: string
   savedReferences?: CitedPage[]
   onOpenReferencePreview?: (preview: ChatReferencePreview, relatedPreviews?: ChatReferencePreview[]) => void
+  onOpenContextDetails?: (references: MessageReference[]) => void
 }) {
   const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
@@ -776,6 +786,9 @@ function CitedReferencesPanel({
     }
     return extractCitedPages(content)
   }, [content, savedReferences])
+  const contextReferences = savedReferences && savedReferences.length > 0
+    ? savedReferences
+    : citedPages
 
   // Async-fetch each cited page's content once and extract image
   // info: count + first URL. Done in parallel; failures are
@@ -1106,19 +1119,32 @@ function CitedReferencesPanel({
       )}
       {citedPages.length > 0 && (
         <div className="rounded-md border border-border/60 bg-muted/30 text-xs mb-1">
-          <button
-            type="button"
-            onClick={() => hasMore && setExpanded(!expanded)}
-            className="flex w-full items-center gap-1.5 px-2 py-1 text-muted-foreground hover:text-foreground transition-colors"
-          >
-            <FileText className="h-3 w-3 shrink-0" />
-            <span className="font-medium">{t("chat.references")} ({citedPages.length})</span>
-            {hasMore && (
-              expanded
-                ? <ChevronDown className="h-3 w-3 ml-auto" />
-                : <ChevronRight className="h-3 w-3 ml-auto" />
+          <div className="flex items-center px-2 py-1 text-muted-foreground">
+            <button
+              type="button"
+              onClick={() => hasMore && setExpanded(!expanded)}
+              className="flex min-w-0 flex-1 items-center gap-1.5 text-left hover:text-foreground transition-colors"
+            >
+              <FileText className="h-3 w-3 shrink-0" />
+              <span className="font-medium">{t("chat.references")} ({citedPages.length})</span>
+              {hasMore && (
+                expanded
+                  ? <ChevronDown className="h-3 w-3 ml-auto" />
+                  : <ChevronRight className="h-3 w-3 ml-auto" />
+              )}
+            </button>
+            {onOpenContextDetails && (
+              <button
+                type="button"
+                onClick={() => onOpenContextDetails(contextReferences)}
+                className="ml-2 inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
+                title={t("chat.contextDetails")}
+              >
+                <ListTree className="h-3 w-3" />
+                {t("chat.details")}
+              </button>
             )}
-          </button>
+          </div>
           <div className="px-2 pb-1.5">
         <ReferenceKnowledgeGraph references={citedPages} onOpenReference={openCitedPage} />
         {visiblePages.map((page, i) => {
@@ -1413,7 +1439,7 @@ function MarkdownContent({ content }: { content: string }) {
     <div>
       {thinking && <ThinkingBlock content={thinking} />}
       <div
-        className="chat-markdown prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 prose-pre:my-2 prose-code:text-xs prose-code:before:content-none prose-code:after:content-none"
+        className="chat-markdown prose max-w-none dark:prose-invert prose-code:before:content-none prose-code:after:content-none"
         dir={direction}
         lang={htmlLang}
         style={{ textAlign: "start" }}
@@ -1516,6 +1542,7 @@ function separateThinking(text: string): { thinking: string | null; answer: stri
 
 /** Streaming thinking: shows latest ~5 lines rolling upward with animation */
 function StreamingThinkingBlock({ content }: { content: string }) {
+  const { t } = useTranslation()
   const lines = content.split("\n").filter((l) => l.trim())
   const visibleLines = lines.slice(-5)
 
@@ -1523,8 +1550,8 @@ function StreamingThinkingBlock({ content }: { content: string }) {
     <div className="rounded-md border border-dashed border-amber-500/30 bg-amber-50/50 dark:bg-amber-950/20 px-2.5 py-2">
       <div className="flex items-center gap-1.5 mb-1.5">
         <span className="text-sm animate-pulse">💭</span>
-        <span className="text-xs font-medium text-amber-700 dark:text-amber-400">Thinking...</span>
-        <span className="text-[10px] text-amber-600/50 dark:text-amber-500/40">{lines.length} lines</span>
+        <span className="text-xs font-medium text-amber-700 dark:text-amber-400">{t("chat.thinking")}</span>
+        <span className="text-[10px] text-amber-600/50 dark:text-amber-500/40">{t("chat.lineCount", { count: lines.length })}</span>
       </div>
       <div className="h-[5lh] overflow-hidden text-xs text-amber-800/70 dark:text-amber-300/60 font-mono leading-relaxed">
         {visibleLines.map((line, i) => (
@@ -1544,6 +1571,7 @@ function StreamingThinkingBlock({ content }: { content: string }) {
 
 /** Completed thinking: collapsed by default, click to expand */
 function ThinkingBlock({ content }: { content: string }) {
+  const { t } = useTranslation()
   const [expanded, setExpanded] = useState(false)
   const lines = content.split("\n").filter((l) => l.trim())
 
@@ -1555,7 +1583,7 @@ function ThinkingBlock({ content }: { content: string }) {
         className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400 hover:bg-amber-100/50 dark:hover:bg-amber-900/20 transition-colors"
       >
         <span className="text-sm">💭</span>
-        <span className="font-medium">Thought for {lines.length} lines</span>
+        <span className="font-medium">{t("chat.thoughtLineCount", { count: lines.length })}</span>
         <span className="text-amber-600/60 dark:text-amber-500/60">
           {expanded ? "▼" : "▶"}
         </span>

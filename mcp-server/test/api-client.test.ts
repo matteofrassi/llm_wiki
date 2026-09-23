@@ -19,13 +19,13 @@ test("projects sends bearer token and parses current project", async () => {
   }
 
   const client = new LlmWikiApiClient({
-    baseUrl: "http://localhost:19828/",
+    baseUrl: "http://127.0.0.1:19828/",
     token: "secret",
     fetchImpl,
   })
   const result = await client.projects()
 
-  assert.equal(calls[0]?.url, "http://localhost:19828/api/v1/projects")
+  assert.equal(calls[0]?.url, "http://127.0.0.1:19828/api/v1/projects")
   assert.equal((calls[0]?.init?.headers as Record<string, string>).Authorization, "Bearer secret")
   assert.equal(result.currentProject?.id, "p1")
   assert.equal(result.projects[0]?.current, true)
@@ -57,7 +57,7 @@ test("search posts JSON body to current project", async () => {
     }), { status: 200 })
   }
 
-  const client = new LlmWikiApiClient({ fetchImpl })
+  const client = new LlmWikiApiClient({ token: "test-only-placeholder", fetchImpl })
   const results = await client.search("current", "query", { topK: 3, includeContent: true })
 
   assert.deepEqual(JSON.parse(body), { query: "query", topK: 3, includeContent: true })
@@ -65,6 +65,54 @@ test("search posts JSON body to current project", async () => {
   assert.equal(results.tokenHits, 2)
   assert.equal(results.vectorHits, 1)
   assert.equal(results.results[0]?.vectorScore, 0.9)
+})
+
+test("embedPage posts a project-relative wiki path", async () => {
+  const fetchImpl: typeof fetch = async (input, init) => {
+    assert.equal(String(input), "http://127.0.0.1:19828/api/v1/projects/project-a/pages/embed")
+    assert.equal(init?.method, "POST")
+    assert.deepEqual(JSON.parse(String(init?.body)), { path: "wiki/ideas/page.md", force: true })
+    return new Response(JSON.stringify({
+      ok: true,
+      result: {
+        path: "wiki/ideas/page.md",
+        pageId: "page",
+        revision: "sha256:abc",
+        chunks: 2,
+        vectorsWritten: 2,
+        status: "indexed",
+      },
+    }), { status: 200, headers: { "Content-Type": "application/json" } })
+  }
+  const client = new LlmWikiApiClient({ fetchImpl, token: "fixture" })
+  assert.deepEqual(await client.embedPage("wiki/ideas/page.md", "project-a", true), {
+    path: "wiki/ideas/page.md",
+    pageId: "page",
+    revision: "sha256:abc",
+    chunks: 2,
+    vectorsWritten: 2,
+    status: "indexed",
+  })
+})
+
+test("embedPage rejects malformed success payloads", async () => {
+  const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
+    ok: true,
+    result: {
+      path: "wiki/page.md",
+      pageId: "page",
+      revision: "sha256:abc",
+      chunks: "2",
+      vectorsWritten: 2,
+      status: "indexed",
+    },
+  }), { status: 200, headers: { "Content-Type": "application/json" } })
+  const client = new LlmWikiApiClient({ fetchImpl, token: "fixture" })
+
+  await assert.rejects(
+    () => client.embedPage("wiki/page.md"),
+    /page embedding result\.chunks: expected finite number/,
+  )
 })
 
 test("chat posts agent request and parses references", async () => {
@@ -86,7 +134,7 @@ test("chat posts agent request and parses references", async () => {
     }), { status: 200 })
   }
 
-  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const client = new LlmWikiApiClient({ baseUrl: "http://127.0.0.1:19828", token: "test-only-placeholder", fetchImpl })
   const response = await client.chat("current", "question", {
     sessionId: "s1",
     mode: "standard",
@@ -98,7 +146,7 @@ test("chat posts agent request and parses references", async () => {
     skills: ["reviewer"],
   })
 
-  assert.equal(url, "http://localhost:19828/api/v1/projects/current/chat")
+  assert.equal(url, "http://127.0.0.1:19828/api/v1/projects/current/chat")
   assert.deepEqual(JSON.parse(body), {
     message: "question",
     sessionId: "s1",
@@ -129,10 +177,10 @@ test("cancelChat posts to the chat cancellation endpoint", async () => {
     }), { status: 200 })
   }
 
-  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const client = new LlmWikiApiClient({ baseUrl: "http://127.0.0.1:19828", token: "test-only-placeholder", fetchImpl })
   const response = await client.cancelChat("current", "s1")
 
-  assert.equal(url, "http://localhost:19828/api/v1/projects/current/chat/s1/cancel")
+  assert.equal(url, "http://127.0.0.1:19828/api/v1/projects/current/chat/s1/cancel")
   assert.equal(method, "POST")
   assert.deepEqual(response, { sessionId: "s1", cancelled: true })
 })
@@ -146,7 +194,7 @@ test("graph parses nodeType from API graph nodes", async () => {
     }), { status: 200 })
   )
 
-  const client = new LlmWikiApiClient({ fetchImpl })
+  const client = new LlmWikiApiClient({ token: "test-only-placeholder", fetchImpl })
   const graph = await client.graph("current")
 
   assert.equal(graph.nodes[0]?.type, "concept")
@@ -163,7 +211,7 @@ test("files exposes truncated flag", async () => {
     }), { status: 200 })
   )
 
-  const client = new LlmWikiApiClient({ fetchImpl })
+  const client = new LlmWikiApiClient({ token: "test-only-placeholder", fetchImpl })
   const files = await client.files("current")
 
   assert.equal(files.truncated, true)
@@ -191,14 +239,14 @@ test("reviews requests unresolved review items with filters", async () => {
     }), { status: 200 })
   }
 
-  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const client = new LlmWikiApiClient({ baseUrl: "http://127.0.0.1:19828", token: "test-only-placeholder", fetchImpl })
   const result = await client.reviews("current", {
     status: "unresolved",
     type: "missing-page",
     limit: 5,
   })
 
-  assert.equal(calls[0], "http://localhost:19828/api/v1/projects/current/reviews?status=unresolved&type=missing-page&limit=5")
+  assert.equal(calls[0], "http://127.0.0.1:19828/api/v1/projects/current/reviews?status=unresolved&type=missing-page&limit=5")
   assert.equal(result.status, "unresolved")
   assert.equal(result.count, 1)
   assert.equal(result.reviews[0]?.id, "r1")
@@ -210,24 +258,47 @@ test("network failures include desktop app hint", async () => {
     throw new Error("ECONNREFUSED")
   }
 
-  const client = new LlmWikiApiClient({ fetchImpl })
-  await assert.rejects(() => client.projects(), /Is the desktop app running\? ECONNREFUSED/)
+  const client = new LlmWikiApiClient({ token: "test-only-placeholder", fetchImpl })
+  await assert.rejects(() => client.projects(), /Is the desktop app running\?/)
 })
 
-test("non-JSON responses include status and body preview", async () => {
+test("non-JSON error responses expose status without body text", async () => {
   const fetchImpl = async (): Promise<Response> => (
     new Response("not json", { status: 502, statusText: "Bad Gateway" })
   )
 
-  const client = new LlmWikiApiClient({ fetchImpl })
-  await assert.rejects(() => client.projects(), /non-JSON response \(502\): not json/)
+  const client = new LlmWikiApiClient({ token: "test-only-placeholder", fetchImpl })
+  await assert.rejects(() => client.projects(), /HTTP 502/)
 })
 
-test("API errors include status and server message", async () => {
+test("API errors expose status without server content", async () => {
   const fetchImpl = async (): Promise<Response> => (
     new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), { status: 401 })
   )
 
-  const client = new LlmWikiApiClient({ fetchImpl })
-  await assert.rejects(() => client.projects(), /LLM Wiki API 401: Unauthorized/)
+  const client = new LlmWikiApiClient({ token: "test-only-placeholder", fetchImpl })
+  await assert.rejects(() => client.projects(), /LLM Wiki API HTTP 401/)
+})
+
+test("require loopback, a token and redirect refusal without disclosing response bodies", async () => {
+  for (const value of ["https://example.com", "http://127.0.0.1.evil/", "http://user:pass@127.0.0.1", "http://127.0.0.1/path", "http://127.0.0.1?token=value", "http://127.0.0.1:0"]) assert.throws(()=>normalizeBaseUrl(value))
+  assert.equal(normalizeBaseUrl("http://localhost:19828"), "http://127.0.0.1:19828")
+  let calls=0
+  const fetchImpl: typeof fetch=async (_url,init)=>{
+    calls++
+    assert.equal(init?.redirect,"error")
+    return new Response("PRIVATE_RESPONSE",{status:200})
+  }
+  await assert.rejects(new LlmWikiApiClient({token:"",fetchImpl}).projects(),/token is missing/)
+  assert.equal(calls,0)
+  await assert.rejects(new LlmWikiApiClient({token:"test-only-placeholder",fetchImpl}).projects(),error=>error instanceof Error && /invalid JSON/.test(error.message) && !error.message.includes("PRIVATE_RESPONSE"))
+})
+
+test("bound response bytes and total request time", async () => {
+  const oversized=new LlmWikiApiClient({token:"test-only-placeholder",fetchImpl:async()=>new Response("x".repeat(2_000_001))})
+  await assert.rejects(oversized.projects(),/size limit/)
+  const stalled=new LlmWikiApiClient({token:"test-only-placeholder",timeoutMs:5,fetchImpl:()=>new Promise(()=>{})})
+  await assert.rejects(stalled.projects(),/timed out/)
+  const stalledBody=new LlmWikiApiClient({token:"test-only-placeholder",timeoutMs:5,fetchImpl:async()=>new Response(new ReadableStream({start(){}}))})
+  await assert.rejects(stalledBody.projects(),/timed out/)
 })

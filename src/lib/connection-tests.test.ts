@@ -93,7 +93,7 @@ describe("provider connection tests", () => {
       expect.any(Array),
       expect.any(Object),
       undefined,
-      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
     )
   })
 
@@ -116,15 +116,15 @@ describe("provider connection tests", () => {
 
   it.each([
     ["Claude Code", "claude-code", "connection", false],
-    ["Claude Code", "claude-code", "connection", undefined],
+    ["Claude Code", "claude-code", "connection", true],
     ["Claude Code", "claude-code", "functional", false],
-    ["Claude Code", "claude-code", "functional", undefined],
+    ["Claude Code", "claude-code", "functional", true],
     ["Codex CLI", "codex-cli", "connection", false],
-    ["Codex CLI", "codex-cli", "connection", undefined],
+    ["Codex CLI", "codex-cli", "connection", true],
     ["Codex CLI", "codex-cli", "functional", false],
-    ["Codex CLI", "codex-cli", "functional", undefined],
+    ["Codex CLI", "codex-cli", "functional", true],
   ] as const)(
-    "isolates local CLI configuration during %s %s tests",
+    "preserves local CLI isolation during %s %s tests",
     async (_label, provider, kind, initialIsolation) => {
       streamChatMock.mockImplementationOnce(async (_cfg, _messages, callbacks) => {
         callbacks.onToken(kind === "functional" ? "LLM_WIKI_TEST_OK" : "OK")
@@ -133,7 +133,7 @@ describe("provider connection tests", () => {
       const cfg: LlmConfig = {
         ...llmConfig,
         provider,
-        ...(initialIsolation === undefined ? {} : { localCliIsolation: initialIsolation }),
+        localCliIsolation: initialIsolation,
       }
 
       const result = kind === "functional"
@@ -142,11 +142,11 @@ describe("provider connection tests", () => {
 
       expect(result.ok).toBe(true)
       expect(streamChatMock).toHaveBeenCalledWith(
-        expect.objectContaining({ provider, localCliIsolation: true }),
+        cfg,
         expect.any(Array),
         expect.any(Object),
         undefined,
-        { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+        { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
       )
       expect(cfg.localCliIsolation).toBe(initialIsolation)
     },
@@ -166,7 +166,7 @@ describe("provider connection tests", () => {
       expect.any(Array),
       expect.any(Object),
       undefined,
-      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
     )
   })
 })

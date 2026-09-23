@@ -1,0 +1,79 @@
+name: Prepare upstream update
+
+on:
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-candidate
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      status: ${{ steps.prepare.outputs.status }}
+      base: ${{ steps.prepare.outputs.base }}
+      head: ${{ steps.prepare.outputs.head }}
+    steps:
+      - name: Check out trusted baseline
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare one stable update
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/upstream-sync.mjs prepare
+      - name: Retain candidate and bounded diagnosis
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: upstream-candidate
+          path: ${{ runner.temp }}/upstream-candidate/
+          retention-days: 14
+          if-no-files-found: warn
+
+  validate:
+    needs: prepare
+    if: needs.prepare.outputs.status == 'ready'
+    uses: ./.github/workflows/validate.yml
+    with:
+      baseline: ${{ needs.prepare.outputs.base }}
+      candidate: ${{ needs.prepare.outputs.head }}
+
+  publish:
+    needs: [prepare, validate]
+    if: needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out trusted baseline for publication only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          fetch-depth: 0
+      - name: Download original preparation artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: upstream-candidate
+          path: ${{ runner.temp }}/upstream-candidate
+      - name: Publish draft without executing candidate code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_BASE: ${{ needs.prepare.outputs.base }}
+          EXPECTED_HEAD: ${{ needs.prepare.outputs.head }}
+          VALIDATION_RESULT: ${{ needs.validate.result }}
+        run: node .github/scripts/upstream-sync.mjs publish

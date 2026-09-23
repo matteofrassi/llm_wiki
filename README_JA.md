@@ -32,7 +32,10 @@
 
 - **2 段階 Chain-of-Thought インジェスト** — LLM がまず分析を行い、その後ソース追跡可能な Wiki ページを生成。増分キャッシュ対応
 - **マルチモーダル画像インジェスト** — PDF 内の埋め込み画像を抽出し、Vision LLM で事実ベースのキャプションを生成。画像対応の検索結果、ライトボックスプレビュー、元資料の該当位置へのジャンプに対応
-- **任意の MinerU PDF 解析** — 表、数式、複雑なレイアウトを含む PDF には MinerU クラウド解析を利用可能。既定では内蔵ローカル解析を使用
+- **マルチフォーマット文書解析** — PDF、Office 文書、EPUB/MOBI、Org mode、画像、メディア、Web クリップ、URL の一括インポートに対応し、内蔵・クラウド・ローカル MinerU による PDF 処理を選択可能
+- **柔軟なモデル設定** — プロジェクト単位のモデル設定、Chat/Ingest の個別ルーティング、カスタム Provider、リクエストヘッダー、ストリーミング出力に対応
+- **原資料に基づく検索** — 「原資料のみ」モードで、インポートした原資料だけに基づいて回答
+- **プロジェクト管理と移行** — 完全なプロジェクトアーカイブを端末間でインポート／エクスポートし、既存 Wiki ページからインデックスを再構築可能
 - **4 シグナル知識グラフ** — 直接リンク、ソース重複、Adamic-Adar、タイプ親和性による関連度モデル
 - **Louvain コミュニティ検出** — 知識クラスタを自動発見し、凝集度を評価
 - **グラフインサイト** — 意外な関連や知識の空白を検出し、ワンクリックで Deep Research を起動
@@ -311,14 +314,15 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 
 | フォーマット | 抽出方法 |
 |--------------|----------|
-| PDF | 内蔵 pdf-extract（Rust）+ ファイルキャッシュ。表、数式、複雑なレイアウト向けに MinerU クラウド解析を任意で利用可能 |
+| PDF | 内蔵 pdf-extract（Rust）+ ファイルキャッシュ。複雑なレイアウト向けに MinerU Cloud、Local API、Pipeline を任意で利用可能 |
 | DOCX | docx-rs — 見出し、太字／斜体、リスト、テーブルを構造化 Markdown へ |
 | PPTX | ZIP + XML — スライド単位で抽出し、見出し／リスト構造を保持 |
 | XLSX/XLS/ODS | calamine — 正しいセル型、複数シート対応、Markdown テーブルに変換 |
+| EPUB/MOBI | 電子書籍のメタデータ、章、本文を抽出し、インジェスト可能なコンテンツへ変換 |
 | 画像 | ネイティブプレビュー（png, jpg, gif, webp, svg など） |
 | 動画／音声 | 内蔵プレイヤー |
 
-> MinerU は任意機能です。有効にすると PDF ファイルは解析のため MinerU クラウドへアップロードされます。機密文書には内蔵ローカル解析の利用を推奨します。MinerU 解析に失敗した場合、LLM Wiki は内蔵解析へフォールバックします。MinerU の利用はファイルサイズ、ページ数、クォータ制限の対象です。
+> MinerU は任意機能です。複雑な PDF には MinerU Cloud、公式 Local API、またはローカル Pipeline モードを利用できます。ローカルモードではファイルを外部へ送信せず、抽出画像はプロジェクト管理下の `wiki/media` に保存されます。失敗時は内蔵解析へフォールバックします。
 
 ### 16. ファイル削除のカスケードクリーンアップ
 
@@ -356,7 +360,10 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **Obsidian 設定** — 推奨設定入りの `.obsidian/` ディレクトリを自動生成
 - **Markdown レンダリング** — 枠線付きの GFM テーブル、整形されたコードブロック、チャットとプレビュー内での wikilink 処理
 - **マルチプロバイダー LLM 対応** — OpenAI、Anthropic、Google、Ollama、カスタム。プロバイダーごとにストリーミングとヘッダーを調整
-- **15 分タイムアウト** — 長時間のインジェスト処理が早すぎる段階で失敗しないようにする
+- **設定可能な LLM タイムアウト** — 遅いローカルモデルや長時間処理に合わせてリクエスト時間を調整
+- **設定可能な Firecrawl** — API キーとカスタム Base URL により、ホスト型・セルフホスト型の両方に対応
+- **折りたたみ可能なファイルサイドバー** — Knowledge/Files ナビゲーションを折りたたみ、状態を保持
+- **プロジェクト保守** — ZIP による移行用インポート／エクスポートと `wiki/index.md` の再構築
 - **dataVersion シグナル** — Wiki コンテンツの変更に合わせてグラフと UI を自動リフレッシュ
 
 ## 技術スタック
@@ -370,8 +377,7 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 | グラフ | sigma.js + graphology + ForceAtlas2 |
 | 検索 | トークン化検索 + グラフ関連度 + 任意のベクトル検索（LanceDB） |
 | ベクトル DB | LanceDB（Rust、組み込み、オプション） |
-| PDF | pdf-extract + 任意の MinerU クラウド解析 |
-| Office | docx-rs + calamine |
+| 文書解析 | pdf-extract + MinerU Cloud/Local + docx-rs + calamine + EPUB/MOBI 抽出 |
 | 多言語対応 | react-i18next |
 | 状態管理 | Zustand |
 | LLM | ストリーミング fetch（OpenAI、Anthropic、Google、Ollama、カスタム） |
@@ -390,10 +396,14 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 ### ソースからビルド
 
 ```bash
-# 前提条件: Node.js 20+, Rust 1.70+
+# 前提条件: Node.js 20+, Rust 1.88+, protoc
+#   macOS:   brew install protobuf
+#   Linux:   sudo apt install protobuf-compiler
+#   Windows: choco install protoc
 git clone https://github.com/nashsu/llm_wiki.git
 cd llm_wiki
 npm install
+npm --prefix mcp-server ci && npm run mcp:build   # mcp-server/dist は Tauri リソースとして同梱されます
 npm run tauri dev      # 開発モード
 npm run tauri build    # 本番ビルド
 ```
@@ -421,6 +431,7 @@ LLM Wiki は組み込みのローカル HTTP API（`http://127.0.0.1:19828` で�
 - `POST /api/v1/projects/{id}/chat` — 非ストリーミングの Rust バックエンド Agent chat エンドポイント。assistant message、references、usage、tool events を返し、Wiki / Source / Web / AnyTXT 検索に対応します。`mode: "deep"` では証拠収集範囲を広げます
 - `GET /api/v1/projects/{id}/graph` — wikilinks の知識グラフ
 - `POST /api/v1/projects/{id}/sources/rescan` — バックエンドの再スキャンをトリガー
+- `POST /api/v1/projects/{id}/pages/embed` — 外部で作成・更新された単一の `wiki/*.md` ページを、ベクトル DB 全体を再構築せずにインデックス化
 
 **設定 → API + MCP** から API を有効化し、Token を発行できます。必要に応じて、ローカルからの認証なしアクセスも切り替えられます。
 

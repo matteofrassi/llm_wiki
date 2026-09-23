@@ -1,0 +1,84 @@
+name: Validate candidate
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        type: string
+        default: macos-latest
+      baseline:
+        type: string
+        default: ''
+      candidate:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ${{ inputs.platform }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out baseline without retained credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.baseline || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download prepared candidate
+        if: inputs.candidate != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: upstream-candidate
+          path: ${{ runner.temp }}/upstream-candidate
+      - name: Load exact candidate without executing its workflow
+        if: inputs.candidate != ''
+        shell: bash
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          git bundle verify "$RUNNER_TEMP/upstream-candidate/candidate.bundle"
+          git fetch "$RUNNER_TEMP/upstream-candidate/candidate.bundle" 'refs/heads/*:refs/remotes/candidate/*'
+          git checkout --detach "$CANDIDATE_COMMIT"
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install locked frontend dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Typecheck and build frontend
+        run: npm run build
+      - name: Run mock and update-safety tests
+        if: inputs.platform == 'macos-latest'
+        run: |
+          npm run test:mocks
+          node --test .github/scripts/upstream-sync.check.mjs
+      - name: Build and test MCP
+        run: |
+          npm --prefix mcp-server ci --ignore-scripts --no-audit --no-fund
+          npm --prefix mcp-server test
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Install native dependencies on macOS
+        if: inputs.platform == 'macos-latest'
+        run: brew install protobuf
+      - name: Install native dependencies on Ubuntu
+        if: inputs.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf protobuf-compiler
+      - name: Install native dependencies on Windows
+        if: inputs.platform == 'windows-latest'
+        run: choco install protoc -y
+      - name: Run native tests on macOS
+        if: inputs.platform == 'macos-latest'
+        working-directory: src-tauri
+        run: cargo test --locked --lib
+      - name: Check other supported builds
+        if: inputs.platform != 'macos-latest'
+        working-directory: src-tauri
+        run: cargo check --locked

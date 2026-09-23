@@ -13,7 +13,10 @@
 //! Cost is one duplicated key name (`proxyConfig`) — see
 //! src/lib/project-store.ts for the matching write site.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +24,7 @@ use crate::keychain;
 
 const DEFAULT_BYPASS_LIST: &str =
     "localhost,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,*.local";
+static ACCEPT_INVALID_CERTS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -30,6 +34,8 @@ pub struct ProxyConfig {
     pub url: String,
     #[serde(default = "default_true", rename = "bypassLocal")]
     pub bypass_local: bool,
+    #[serde(default, rename = "acceptInvalidCerts")]
+    pub accept_invalid_certs: bool,
 }
 
 // Hand-written Default impl so its `bypass_local` matches what
@@ -45,6 +51,7 @@ impl Default for ProxyConfig {
             enabled: false,
             url: String::new(),
             bypass_local: true,
+            accept_invalid_certs: false,
         }
     }
 }
@@ -54,8 +61,8 @@ fn default_true() -> bool {
 }
 
 /// Read `proxyConfig` out of the project's `app-state.json`. Returns
-/// None if the file doesn't exist, can't be parsed, or has no proxy
-/// section — caller treats those identically to "no proxy".
+/// Return None only for an absent file or proxy section. Return an error
+/// for unreadable, malformed or unavailable credentials so startup blocks egress.
 pub fn read_proxy_config_from_store(store_path: &Path) -> Result<Option<ProxyConfig>, String> {
     let content = match std::fs::read_to_string(store_path) {
         Ok(content) => content,
@@ -88,8 +95,8 @@ pub fn read_proxy_config_from_store(store_path: &Path) -> Result<Option<ProxyCon
 ///
 /// Validates the URL scheme — only `http://` and `https://` are
 /// accepted in this version. Anything else (SOCKS5, malformed,
-/// missing scheme) is treated as "disabled" so the user doesn't
-/// silently trip over a half-working proxy.
+/// missing scheme) blocks outbound proxy traffic while enabled. Never
+/// downgrade an invalid configured proxy to a direct connection.
 ///
 /// Concurrency note: `std::env::set_var` mutates process-wide
 /// state and is racy if any other thread reads env at the same
@@ -106,10 +113,11 @@ pub fn apply_proxy_env(config: &ProxyConfig) -> String {
     // Every "disabled" path MUST clear all three env vars, not just
     // return — otherwise toggling the proxy off after it was on
     // leaves the previous values in place and reqwest keeps routing
-    // through the now-removed proxy. The same applies to invalid
-    // URLs and unsupported schemes (treat as disabled).
+    // through the now-removed proxy. Block invalid enabled configurations.
     let url = config.url.trim();
     let invalid_scheme = !is_valid_proxy_url(url) || has_embedded_credentials(url);
+
+    ACCEPT_INVALID_CERTS.store(config.enabled && !invalid_scheme && config.accept_invalid_certs, Ordering::Relaxed);
 
     if !config.enabled || url.is_empty() || invalid_scheme {
         if config.enabled {
@@ -130,14 +138,17 @@ pub fn apply_proxy_env(config: &ProxyConfig) -> String {
         std::env::remove_var("NO_PROXY");
     }
     format!(
-        "enabled ({}, bypass_local={})",
+        "enabled ({}, bypass_local={}, accept_invalid_certs={})",
         redact_url(url),
-        config.bypass_local
+        config.bypass_local,
+        config.accept_invalid_certs,
     )
 }
 
 fn is_valid_proxy_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+    reqwest::Url::parse(url).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+    })
 }
 
 fn has_embedded_credentials(url: &str) -> bool {
@@ -157,6 +168,12 @@ fn set_blocking_proxy_env(bypass_local: bool) {
     } else {
         std::env::remove_var("NO_PROXY");
     }
+}
+
+/// Apply the process-wide TLS policy to native reqwest clients. This mirrors
+/// the `danger.acceptInvalidCerts` option injected into tauri-plugin-http.
+pub fn configure_http_client(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.danger_accept_invalid_certs(ACCEPT_INVALID_CERTS.load(Ordering::Relaxed))
 }
 
 /// Strip embedded basic-auth credentials from a URL before logging.
@@ -188,7 +205,7 @@ fn redact_url(url: &str) -> String {
 }
 
 /// Remove all three proxy env vars. Called whenever the user
-/// disables the proxy or supplies an invalid URL — this is what
+/// explicitly disables the proxy — this is what
 /// makes "turn off proxy" actually take effect for the next fetch
 /// (without it, the previous HTTP_PROXY / HTTPS_PROXY / NO_PROXY
 /// stay set in the process env and reqwest keeps using them).
@@ -251,6 +268,7 @@ mod tests {
                 enabled: false,
                 url: "http://x:1".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             assert!(s.contains("disabled"));
             assert!(std::env::var("HTTP_PROXY").is_err());
@@ -265,6 +283,7 @@ mod tests {
                 enabled: true,
                 url: "http://127.0.0.1:7890".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             assert_eq!(
                 std::env::var("HTTP_PROXY").unwrap(),
@@ -282,6 +301,27 @@ mod tests {
     }
 
     #[test]
+    fn invalid_certificates_are_accepted_only_for_an_active_proxy() {
+        isolated(|| {
+            apply_proxy_env(&ProxyConfig {
+                enabled: true,
+                url: "http://127.0.0.1:7890".into(),
+                bypass_local: true,
+                accept_invalid_certs: true,
+            });
+            assert!(ACCEPT_INVALID_CERTS.load(Ordering::Relaxed));
+
+            apply_proxy_env(&ProxyConfig {
+                enabled: false,
+                url: "http://127.0.0.1:7890".into(),
+                bypass_local: true,
+                accept_invalid_certs: true,
+            });
+            assert!(!ACCEPT_INVALID_CERTS.load(Ordering::Relaxed));
+        });
+    }
+
+    #[test]
     fn bypass_local_off_clears_no_proxy() {
         isolated(|| {
             std::env::set_var("NO_PROXY", "stale-value");
@@ -289,6 +329,7 @@ mod tests {
                 enabled: true,
                 url: "http://x:1".into(),
                 bypass_local: false,
+                accept_invalid_certs: false,
             });
             // The stale value must be cleared so the user's intent
             // (everything goes through the proxy) is honored.
@@ -303,6 +344,7 @@ mod tests {
                 enabled: true,
                 url: "socks5://x:1".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:9");
         });
@@ -315,8 +357,23 @@ mod tests {
                 enabled: true,
                 url: "   ".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:9");
+        });
+    }
+
+    #[test]
+    fn rejects_malformed_urls_even_when_the_scheme_prefix_looks_supported() {
+        isolated(|| {
+            apply_proxy_env(&ProxyConfig {
+                enabled: true,
+                url: "http://".into(),
+                bypass_local: true,
+                accept_invalid_certs: true,
+            });
+            assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:9");
+            assert!(!ACCEPT_INVALID_CERTS.load(Ordering::Relaxed));
         });
     }
 
@@ -332,6 +389,7 @@ mod tests {
                 enabled: true,
                 url: "http://127.0.0.1:7890".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             assert_eq!(
                 std::env::var("HTTP_PROXY").unwrap(),
@@ -342,6 +400,7 @@ mod tests {
                 enabled: false,
                 url: "http://127.0.0.1:7890".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             assert!(std::env::var("HTTP_PROXY").is_err());
             assert!(std::env::var("HTTPS_PROXY").is_err());
@@ -358,11 +417,13 @@ mod tests {
                 enabled: true,
                 url: "http://127.0.0.1:7890".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             apply_proxy_env(&ProxyConfig {
                 enabled: true,
                 url: "socks5://x:1".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:9");
         });
@@ -375,6 +436,7 @@ mod tests {
                 enabled: true,
                 url: "https://proxy.corp:443".into(),
                 bypass_local: false,
+                accept_invalid_certs: false,
             });
             assert_eq!(
                 std::env::var("HTTPS_PROXY").unwrap(),
@@ -415,6 +477,7 @@ mod tests {
                 enabled: true,
                 url: "http://secretuser:secretpass@proxy.corp:8080".into(),
                 bypass_local: true,
+                accept_invalid_certs: false,
             });
             assert!(!summary.contains("secretpass"));
             assert!(!summary.contains("secretuser"));
@@ -443,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_camelcase_bypassLocal_field() {
+    fn parses_camelcase_bypass_local_field() {
         // Frontend writes `bypassLocal` (camelCase). We must accept
         // that exact spelling — verify the serde rename works.
         let json = r#"{"enabled": true, "url": "http://x:1", "bypassLocal": false}"#;
@@ -454,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_proxyConfig_returns_none() {
+    fn missing_proxy_config_returns_none() {
         let dir = tempdir_for_test();
         let path = dir.join("missing.json");
         assert!(read_proxy_config_from_store(&path).unwrap().is_none());

@@ -17,7 +17,6 @@ const EXT_MAP: Record<string, FileCategory> = {
 
   // Text
   txt: "text",
-  rtf: "text",
   log: "text",
 
   // Code
@@ -105,10 +104,19 @@ const EXT_MAP: Record<string, FileCategory> = {
   // Documents. Some are previewable through backend text extraction.
   doc: "document",
   docx: "document",
+  docm: "document",
   xls: "document",
   xlsx: "document",
+  xlsm: "document",
+  xlsb: "document",
   ppt: "document",
+  pps: "document",
+  pot: "document",
   pptx: "document",
+  pptm: "document",
+  ppsx: "document",
+  ppsm: "document",
+  rtf: "document",
   odt: "document",
   ods: "document",
   odp: "document",
@@ -116,6 +124,8 @@ const EXT_MAP: Record<string, FileCategory> = {
   numbers: "document",
   key: "document",
   epub: "document",
+  mobi: "document",
+  org: "document",
 
   // Data
   json: "data",
@@ -128,7 +138,10 @@ const EXT_MAP: Record<string, FileCategory> = {
 }
 
 export function getFileCategory(filePath: string): FileCategory {
-  const ext = filePath.split(".").pop()?.toLowerCase() ?? ""
+  // Strip the directory first (like getFileExtension) so basename entries such as
+  // "dockerfile"/"makefile" resolve; fall back to the basename when there's no dot.
+  const fileName = filePath.split(/[\\/]/).pop() ?? ""
+  const ext = fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() ?? "" : fileName.toLowerCase()
   return EXT_MAP[ext] ?? "unknown"
 }
 
@@ -140,12 +153,25 @@ export const EXTRACTED_TEXT_PREVIEW_EXTENSIONS = new Set([
   "pdf",
   "doc",
   "docx",
+  "docm",
+  "ppt",
+  "pps",
+  "pot",
   "pptx",
+  "pptm",
+  "ppsx",
+  "ppsm",
   "xls",
   "xlsx",
+  "xlsm",
+  "xlsb",
   "odt",
   "ods",
   "odp",
+  "rtf",
+  "epub",
+  "mobi",
+  "org",
 ])
 
 export function getFileExtension(filePath: string): string {
