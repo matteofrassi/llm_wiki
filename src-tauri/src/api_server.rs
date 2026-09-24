@@ -14,7 +14,6 @@ use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Manager};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 use crate::cors::{local_cors_headers, request_origin};
 use crate::{agent, commands, keychain, server_bind};
@@ -2433,9 +2432,11 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
 }
 
 fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
+    // Validate the root before traversal; preserve caller-relative output paths.
+    safe_join(project_path, "wiki")?;
     let wiki_root = Path::new(project_path).join("wiki");
     let mut raw: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
-    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
+    for entry in commands::search::visible_wiki_entries(&wiki_root) {
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
         {
@@ -2628,6 +2629,51 @@ mod tests {
         let path = std::env::temp_dir().join(format!("llm-wiki-api-test-{id}-{seq}"));
         fs::create_dir_all(path.join("wiki")).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn public_retrieval_excludes_hidden_pages_and_directories() {
+        let root = test_project_dir();
+        fs::create_dir_all(root.join("wiki/.archive")).unwrap();
+        fs::create_dir_all(root.join("wiki/visible")).unwrap();
+        for rel in ["wiki/public.md", "wiki/visible/nested.md", "wiki/.private.md", "wiki/.archive/private.md"] {
+            fs::write(root.join(rel), "# Boundaryfixture\nBoundaryfixture shared term").unwrap();
+        }
+        let project = root.to_string_lossy().to_string();
+        let response = commands::search::search_project_inner(project.clone(), "Boundaryfixture".into(), 50, true, None).await.unwrap();
+        let paths: BTreeSet<_> = response.results.iter().map(|item| item.path.as_str()).collect();
+        assert_eq!(paths, BTreeSet::from(["wiki/public.md", "wiki/visible/nested.md"]));
+        let (nodes, _) = build_graph(&project).unwrap();
+        let paths: BTreeSet<_> = nodes.iter().map(|node| node.path.as_str()).collect();
+        assert_eq!(paths, BTreeSet::from(["wiki/public.md", "wiki/visible/nested.md"]));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_retrieval_rejects_root_links_and_skips_nested_links() {
+        use std::os::unix::fs::symlink;
+        let root = test_project_dir();
+        let outside = test_project_dir();
+        fs::write(root.join("wiki/public.md"), "# Boundaryfixture\nBoundaryfixture public").unwrap();
+        fs::write(outside.join("wiki/private.md"), "# Boundaryfixture\nBoundaryfixture private").unwrap();
+        symlink(outside.join("wiki/private.md"), root.join("wiki/alias.md")).unwrap();
+        symlink(outside.join("wiki"), root.join("wiki/linked")).unwrap();
+        let project = root.to_string_lossy().to_string();
+        let response = commands::search::search_project_inner(project.clone(), "Boundaryfixture".into(), 50, true, None).await.unwrap();
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].path, "wiki/public.md");
+        let (nodes, _) = build_graph(&project).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].path, "wiki/public.md");
+        fs::rename(root.join("wiki"), root.join("original-wiki")).unwrap();
+        symlink(outside.join("wiki"), root.join("wiki")).unwrap();
+        assert!(safe_join(&project, "wiki").is_err());
+        assert!(build_graph(&project).is_err());
+        let response = commands::search::search_project_inner(project, "Boundaryfixture".into(), 50, true, None).await.unwrap();
+        assert!(response.results.is_empty());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]

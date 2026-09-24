@@ -180,7 +180,7 @@ fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinks
 
     let mut pages = BTreeMap::<String, GraphPage>::new();
     let canonical_project = project.to_string_lossy();
-    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
+    for entry in visible_wiki_entries(&wiki_root) {
         if pages.len() >= MAX_SEARCH_FILES
             || !entry.file_type().is_file()
             || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
@@ -324,6 +324,17 @@ fn validate_query_embedding(embedding: Vec<f32>) -> Result<Vec<f32>, String> {
     Ok(embedding)
 }
 
+/// Keep retrieval scans within visible wiki entries without following aliases.
+/// Share this boundary with API graph traversal and desktop page-link lookup.
+pub(crate) fn visible_wiki_entries(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    WalkDir::new(root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(Result::ok)
+}
+
 pub async fn search_project_inner(
     project_path: String,
     query: String,
@@ -349,7 +360,7 @@ pub async fn search_project_inner(
     let wiki_root = Path::new(&project_path).join("wiki");
     if wiki_root.exists() {
         let mut searched_files = 0usize;
-        for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
+        for entry in visible_wiki_entries(&wiki_root) {
             if !entry.file_type().is_file()
                 || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
             {
