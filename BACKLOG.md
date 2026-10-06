@@ -11,5 +11,5 @@
 
 ## Deferred
 
-- [ ] Accept the isolated v0.6.11 candidate after release review; merge the weekly/manual update workflow into the default branch and verify its first cloud run before reporting scheduling as active.
+- [ ] Complete draft PR #6 cloud checks, obtain explicit merge approval, preserve both histories during default-branch integration, and verify the update-preparation `current` state. Reuse the completed code/security review and `pending_review` cloud test; keep packaged-release/adoption gates in `UPSTREAM_MAINTENANCE.md`.
 - [ ] Retire local patches only when upstream provides verified equivalents; follow `UPSTREAM_MAINTENANCE.md`.

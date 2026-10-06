@@ -4,10 +4,11 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,7 @@ const SHELL_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 1;
 const DEFAULT_ANYTXT_ENDPOINT: &str = "http://127.0.0.1:9920";
 const DEFAULT_ANYTXT_LIMIT: usize = 20;
 const ANYTXT_LAST_MODIFY_END: i64 = 2_147_483_647;
+static WIKI_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -325,6 +327,16 @@ pub struct WikiWriteOutput {
     pub existed_before: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedWikiWriteOutput {
+    pub path: String,
+    pub bytes: usize,
+    pub allow_overwrite: bool,
+    pub verified: bool,
+    pub existed_before: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -656,12 +668,32 @@ pub fn write_wiki_page_with_options(
     Ok(write_wiki_page_with_activity(project_path, rel_path, content, allow_overwrite)?.reference)
 }
 
+pub fn write_wiki_page_verified(
+    project_path: &str,
+    rel_path: &str,
+    content: &str,
+    allow_overwrite: bool,
+) -> Result<VerifiedWikiWriteOutput, String> {
+    let output = write_wiki_page_with_activity(project_path, rel_path, content, allow_overwrite)?;
+    Ok(VerifiedWikiWriteOutput {
+        path: output.reference.path,
+        bytes: content.len(),
+        allow_overwrite,
+        verified: true,
+        existed_before: output.existed_before,
+    })
+}
+
 fn write_wiki_page_with_activity(
     project_path: &str,
     rel_path: &str,
     content: &str,
     allow_overwrite: bool,
 ) -> Result<WikiWriteOutput, String> {
+    let _write_guard = WIKI_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "wiki.write_page lock is unavailable".to_string())?;
     if content.len() > MAX_WRITE_PAGE_BYTES {
         return Err("wiki.write_page content is too large".to_string());
     }
@@ -672,6 +704,7 @@ fn write_wiki_page_with_activity(
         // project already contains a symlink under `wiki/`, this prevents even
         // empty intermediate directories from being created outside the project.
         ensure_existing_ancestor_bound(project_path, parent)?;
+        ensure_generated_write_path(project_path, &path, "wiki.write_page")?;
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create wiki page directory: {err}"))?;
         ensure_project_bound_path(project_path, parent)?;
@@ -684,10 +717,34 @@ fn write_wiki_page_with_activity(
                 .to_string(),
         );
     }
+    if path
+        .symlink_metadata()
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err("wiki.write_page refuses to overwrite a symlink".to_string());
+    }
     let existed_before = path.is_file();
+    let previous_bytes = existed_before
+        .then(|| fs::read(&path))
+        .transpose()
+        .map_err(|err| format!("Failed to read existing wiki page before replacement: {err}"))?;
     let previous_content = workspace_rollback_snapshot(&path);
     crate::commands::file_history::record_file_version(&path, "baseline", "before.wiki.write_page");
-    fs::write(&path, content).map_err(|err| format!("Failed to write wiki page: {err}"))?;
+    atomic_replace_file(&path, content.as_bytes())?;
+    let persisted =
+        fs::read(&path).map_err(|err| format!("Failed to verify persisted wiki page: {err}"))?;
+    if persisted != content.as_bytes() {
+        let rollback = if let Some(previous) = previous_bytes {
+            atomic_replace_file(&path, &previous)
+        } else {
+            fs::remove_file(&path).map_err(|err| format!("Failed to remove unverified page: {err}"))
+        };
+        return Err(match rollback {
+            Ok(()) => "Persisted wiki page did not match the requested content; the previous state was restored".to_string(),
+            Err(err) => format!("Persisted wiki page did not match the requested content, and rollback failed: {err}"),
+        });
+    }
     crate::commands::file_history::record_file_version(&path, "agent", "wiki.write_page");
     Ok(WikiWriteOutput {
         reference: AgentReference {
@@ -708,6 +765,67 @@ fn write_wiki_page_with_activity(
         existed_before,
         previous_content,
     })
+}
+
+fn atomic_replace_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Failed to resolve wiki page parent directory".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "wiki.write_page path must be valid UTF-8".to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".{file_name}.llm-wiki-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|err| format!("Failed to create wiki page temp file: {err}"))?;
+    if let Err(err) = file.write_all(content).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("Failed to write wiki page temp file: {err}"));
+    }
+    drop(file);
+
+    #[cfg(not(windows))]
+    {
+        if let Err(err) = fs::rename(&temp, path) {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Failed to replace wiki page: {err}"));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let backup = parent.join(format!(
+            ".{file_name}.llm-wiki-{}-{nonce}.bak",
+            std::process::id()
+        ));
+        let had_target = path.exists();
+        if had_target {
+            fs::rename(path, &backup)
+                .map_err(|err| format!("Failed to stage existing wiki page: {err}"))?;
+        }
+        if let Err(err) = fs::rename(&temp, path) {
+            if had_target {
+                let _ = fs::rename(&backup, path);
+            }
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Failed to replace wiki page: {err}"));
+        }
+        if had_target {
+            let _ = fs::remove_file(backup);
+        }
+    }
+
+    Ok(())
 }
 
 fn write_workspace_file(
@@ -809,12 +927,15 @@ fn resolve_workspace_write_target(
         return Err(format!("{tool_name} project directory is not available"));
     }
     let workspace = agent_workspace_path(project);
+    ensure_existing_ancestor_bound(project_path, &workspace)?;
+    ensure_generated_write_path(project_path, &workspace, tool_name)?;
     fs::create_dir_all(&workspace)
         .map_err(|err| format!("{tool_name} failed to create workspace: {err}"))?;
     ensure_project_bound_path(project_path, &workspace)?;
     let path = workspace.join(&rel);
     if let Some(parent) = path.parent() {
         ensure_existing_ancestor_bound(project_path, parent)?;
+        ensure_generated_write_path(project_path, &path, tool_name)?;
         fs::create_dir_all(parent)
             .map_err(|err| format!("{tool_name} failed to create directory: {err}"))?;
         ensure_project_bound_path(project_path, parent)?;
@@ -2556,6 +2677,32 @@ fn safe_project_join(project_path: &str, rel: &str) -> Result<PathBuf, String> {
     Ok(joined)
 }
 
+// Preserve an approved project-root alias, but never redirect generated writes
+// through a mutable directory or file symlink, including links inside the project.
+fn ensure_generated_write_path(
+    project_path: &str,
+    path: &Path,
+    tool_name: &str,
+) -> Result<(), String> {
+    let project = Path::new(project_path);
+    let relative = path
+        .strip_prefix(project)
+        .map_err(|_| format!("{tool_name} path escapes project directory"))?;
+    let mut cursor = project.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component.as_os_str());
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("{tool_name} path contains a symlink"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("{tool_name} failed to inspect write path: {error}")),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_existing_ancestor_bound(project_path: &str, path: &Path) -> Result<(), String> {
     let mut cursor = path;
     while !cursor.exists() {
@@ -2604,6 +2751,10 @@ fn normalize_rel_path(path: &str) -> String {
 }
 
 fn normalize_wiki_write_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return Err("wiki.write_page path must stay inside the project".to_string());
+    }
     let rel = normalize_rel_path(path);
     let lower = rel.to_ascii_lowercase();
     if !lower.starts_with("wiki/") || !lower.ends_with(".md") {
@@ -3204,6 +3355,14 @@ mod tests {
             false
         )
         .is_err());
+        let absolute_error = write_wiki_page_with_options(
+            root.to_str().unwrap(),
+            "/wiki/absolute.md",
+            "# Absolute",
+            false,
+        )
+        .unwrap_err();
+        assert!(absolute_error.contains("must stay inside the project"));
         assert!(write_wiki_page_with_options(
             root.to_str().unwrap(),
             "raw/sources/a.md",
@@ -3282,6 +3441,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overwritten.title, "Replaced");
+
+        let verified = write_wiki_page_verified(
+            root.to_str().unwrap(),
+            "wiki/queries/verified.md",
+            "# Verified\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(verified.path, "wiki/queries/verified.md");
+        assert_eq!(verified.bytes, "# Verified\n".len());
+        assert!(verified.verified);
+        assert!(!verified.existed_before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_writes_reject_in_project_symlink_redirects() {
+        use std::os::unix::fs::symlink;
+
+        for linked_root in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("llm-wiki-write-boundary-{}", Uuid::new_v4()));
+            let sources = root.join("raw/sources");
+            fs::create_dir_all(&sources).unwrap();
+            fs::write(sources.join("evidence.md"), "immutable source").unwrap();
+            for namespace in ["wiki", "agent-workspace"] {
+                if linked_root {
+                    symlink(&sources, root.join(namespace)).unwrap();
+                } else {
+                    fs::create_dir_all(root.join(namespace)).unwrap();
+                    symlink(&sources, root.join(namespace).join("redirect")).unwrap();
+                }
+            }
+            let rel = if linked_root {
+                "evidence.md"
+            } else {
+                "redirect/evidence.md"
+            };
+            let new_rel = if linked_root {
+                "newsub/new.md"
+            } else {
+                "redirect/newsub/new.md"
+            };
+            for target in [rel, new_rel] {
+                let error = write_wiki_page_verified(
+                    root.to_str().unwrap(),
+                    &format!("wiki/{target}"),
+                    "replaced",
+                    true,
+                )
+                .unwrap_err();
+                assert!(error.contains("symlink"), "{error}");
+                let error =
+                    write_workspace_file(root.to_str().unwrap(), target, "replaced").unwrap_err();
+                assert!(error.contains("symlink"), "{error}");
+                let error =
+                    append_workspace_file(root.to_str().unwrap(), target, "appended").unwrap_err();
+                assert!(error.contains("symlink"), "{error}");
+            }
+            assert_eq!(
+                fs::read_to_string(sources.join("evidence.md")).unwrap(),
+                "immutable source"
+            );
+            assert!(!sources.join("newsub").exists());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_wiki_page_refuses_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("llm-wiki-agent-link-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("wiki")).unwrap();
+        fs::write(root.join("purpose.md"), "protected").unwrap();
+        symlink(root.join("purpose.md"), root.join("wiki/linked.md")).unwrap();
+
+        let error = write_wiki_page_verified(
+            root.to_str().unwrap(),
+            "wiki/linked.md",
+            "overwritten",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("symlink"));
+        assert_eq!(
+            fs::read_to_string(root.join("purpose.md")).unwrap(),
+            "protected"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

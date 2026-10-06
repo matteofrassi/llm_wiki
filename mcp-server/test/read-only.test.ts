@@ -38,7 +38,7 @@ test("expose exactly seven read-only tools and deny mutation calls before HTTP",
     const tools=(await f.client.listTools()).tools
     assert.deepEqual(tools.map(t=>t.name).sort(),names.slice().sort())
     assert.ok(tools.every(t=>t.annotations?.readOnlyHint===true && t.annotations?.openWorldHint===false))
-    for (const name of ["llm_wiki_chat","llm_wiki_rescan_sources","llm_wiki_set_project","llm_wiki_embed_page"]) {
+    for (const name of ["llm_wiki_chat","llm_wiki_rescan_sources","llm_wiki_set_project","llm_wiki_embed_page","llm_wiki_write_page"]) {
       await assert.rejects(f.client.callTool({name,arguments:{}}))
     }
     assert.equal(f.calls.length,0)
