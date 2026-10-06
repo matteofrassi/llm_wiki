@@ -108,7 +108,7 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          # Tag-triggered runs publish a real GitHub Release.
+          # Tag-triggered runs prepare a draft GitHub Release.
           # Manual (workflow_dispatch) runs leave tagName/releaseName
           # empty so tauri-action skips the release-upload step and
           # just produces bundle artifacts — useful for testing a
@@ -116,9 +116,15 @@ jobs:
           tagName: ${{ github.event_name == 'push' && github.ref_name || '' }}
           releaseName: ${{ github.event_name == 'push' && format('LLM Wiki {0}', github.ref_name) || '' }}
           releaseBody: 'See the assets below for download links.'
-          releaseDraft: false
+          # Keep tag builds as drafts after verification; publish manually
+          # only after the fork release review and acceptance gates pass.
+          releaseDraft: ${{ github.event_name == 'push' }}
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Verify signed macOS app and DMG
+        if: github.event_name == 'push' && startsWith(matrix.platform, 'macos-')
+        run: .github/scripts/verify-macos-release.sh src-tauri/target
 
       - name: Package Windows portable zip
         if: matrix.platform == 'windows-latest'

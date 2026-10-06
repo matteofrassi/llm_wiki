@@ -49,3 +49,16 @@ Record the 2026-09-23 local validation: frontend build/typecheck PASS; 1,891 moc
 Use the migration owner's existing completion plan for activation, pilot acceptance, source migration and legacy retirement. Do not duplicate those steps here or consider the old knowledge Favorite removable before that plan passes.
 
 References: [GitHub workflow triggering](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow), [scheduled workflow behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+
+## v0.6.12 manual candidate
+
+Resolve the five conflicts reported by the scheduled preparation runs on 2026-09-28 and 2026-10-05 in an isolated candidate. Preserve baseline `0a8bb766c1e6976f21cd7973573540829b44cb56` and upstream release `48fd970e206a02a6d2028d1dbfc41b7a0345bf0b` through a normal merge. Keep the conflict and protected-workflow gates intact; treat this stop as required manual integration, not a failed application update.
+
+- Keep the seven-tool MCP entrypoint unchanged; deny the upstream write tool before HTTP. Adapt the three new mock fixtures to mandatory authentication.
+- Combine cached graph pagination with the existing visible-file traversal and root-link rejection. Keep hidden files and symbolic links excluded.
+- Retain Keychain storage, plaintext-secret startup protection, configured CLI isolation, custom app identity and the browser-clipper exclusion.
+- Keep macOS signature/notarization verification and leave tag releases as drafts for manual acceptance. Do not restore upstream browser-extension packaging or automatic release publication.
+
+Record the 2026-10-06 local validation: frontend typecheck/build PASS; 2,020 mock tests PASS; 33 MCP tests PASS; 432 native tests PASS, with two existing manual probes ignored; eight update-safety tests PASS. Use isolated dependency and native-build copies; make no real-model calls, source imports or installed-app changes for these checks.
+
+Keep publication, independent release review, packaged-app verification and source canaries separate from these local results. Preserve unpublished local work in its existing branch; do not replace the active application with this default-branch candidate. Open one draft PR after publication approval. Expect the updater to wait while that draft is open, and to recognize this release as current after a normal merge. Do not squash upstream history or claim the scheduled failure is cleared before default-branch integration and cloud verification.
