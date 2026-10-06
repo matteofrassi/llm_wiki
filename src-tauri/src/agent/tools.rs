@@ -704,6 +704,7 @@ fn write_wiki_page_with_activity(
         // project already contains a symlink under `wiki/`, this prevents even
         // empty intermediate directories from being created outside the project.
         ensure_existing_ancestor_bound(project_path, parent)?;
+        ensure_generated_write_path(project_path, &path, "wiki.write_page")?;
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create wiki page directory: {err}"))?;
         ensure_project_bound_path(project_path, parent)?;
@@ -926,12 +927,15 @@ fn resolve_workspace_write_target(
         return Err(format!("{tool_name} project directory is not available"));
     }
     let workspace = agent_workspace_path(project);
+    ensure_existing_ancestor_bound(project_path, &workspace)?;
+    ensure_generated_write_path(project_path, &workspace, tool_name)?;
     fs::create_dir_all(&workspace)
         .map_err(|err| format!("{tool_name} failed to create workspace: {err}"))?;
     ensure_project_bound_path(project_path, &workspace)?;
     let path = workspace.join(&rel);
     if let Some(parent) = path.parent() {
         ensure_existing_ancestor_bound(project_path, parent)?;
+        ensure_generated_write_path(project_path, &path, tool_name)?;
         fs::create_dir_all(parent)
             .map_err(|err| format!("{tool_name} failed to create directory: {err}"))?;
         ensure_project_bound_path(project_path, parent)?;
@@ -2673,6 +2677,32 @@ fn safe_project_join(project_path: &str, rel: &str) -> Result<PathBuf, String> {
     Ok(joined)
 }
 
+// Preserve an approved project-root alias, but never redirect generated writes
+// through a mutable directory or file symlink, including links inside the project.
+fn ensure_generated_write_path(
+    project_path: &str,
+    path: &Path,
+    tool_name: &str,
+) -> Result<(), String> {
+    let project = Path::new(project_path);
+    let relative = path
+        .strip_prefix(project)
+        .map_err(|_| format!("{tool_name} path escapes project directory"))?;
+    let mut cursor = project.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component.as_os_str());
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("{tool_name} path contains a symlink"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("{tool_name} failed to inspect write path: {error}")),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_existing_ancestor_bound(project_path: &str, path: &Path) -> Result<(), String> {
     let mut cursor = path;
     while !cursor.exists() {
@@ -3424,6 +3454,60 @@ mod tests {
         assert!(verified.verified);
         assert!(!verified.existed_before);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_writes_reject_in_project_symlink_redirects() {
+        use std::os::unix::fs::symlink;
+
+        for linked_root in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("llm-wiki-write-boundary-{}", Uuid::new_v4()));
+            let sources = root.join("raw/sources");
+            fs::create_dir_all(&sources).unwrap();
+            fs::write(sources.join("evidence.md"), "immutable source").unwrap();
+            for namespace in ["wiki", "agent-workspace"] {
+                if linked_root {
+                    symlink(&sources, root.join(namespace)).unwrap();
+                } else {
+                    fs::create_dir_all(root.join(namespace)).unwrap();
+                    symlink(&sources, root.join(namespace).join("redirect")).unwrap();
+                }
+            }
+            let rel = if linked_root {
+                "evidence.md"
+            } else {
+                "redirect/evidence.md"
+            };
+            let new_rel = if linked_root {
+                "newsub/new.md"
+            } else {
+                "redirect/newsub/new.md"
+            };
+            for target in [rel, new_rel] {
+                let error = write_wiki_page_verified(
+                    root.to_str().unwrap(),
+                    &format!("wiki/{target}"),
+                    "replaced",
+                    true,
+                )
+                .unwrap_err();
+                assert!(error.contains("symlink"), "{error}");
+                let error =
+                    write_workspace_file(root.to_str().unwrap(), target, "replaced").unwrap_err();
+                assert!(error.contains("symlink"), "{error}");
+                let error =
+                    append_workspace_file(root.to_str().unwrap(), target, "appended").unwrap_err();
+                assert!(error.contains("symlink"), "{error}");
+            }
+            assert_eq!(
+                fs::read_to_string(sources.join("evidence.md")).unwrap(),
+                "immutable source"
+            );
+            assert!(!sources.join("newsub").exists());
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[cfg(unix)]

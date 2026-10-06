@@ -11,5 +11,5 @@
 
 ## Deferred
 
-- [ ] Publish and review the isolated v0.6.12 conflict-resolution candidate, preserve both histories during default-branch integration, and verify the next update-preparation run. Keep release/adoption gates in `UPSTREAM_MAINTENANCE.md`.
+- [ ] Complete draft PR #6 cloud checks, obtain explicit merge approval, preserve both histories during default-branch integration, and verify the update-preparation `current` state. Reuse the completed code/security review and `pending_review` cloud test; keep packaged-release/adoption gates in `UPSTREAM_MAINTENANCE.md`.
 - [ ] Retire local patches only when upstream provides verified equivalents; follow `UPSTREAM_MAINTENANCE.md`.
