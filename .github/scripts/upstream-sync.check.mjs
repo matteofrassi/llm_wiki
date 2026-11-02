@@ -133,3 +133,42 @@ test('recreate the same commit in a fresh retry checkout after interrupted publi
   assert.equal(retry.head, first.head);
   verifyCandidate(cwd, retry);
 });
+
+test('pin Node 24 action upgrades and keep the manual artifact check read-only', () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+  const pins = new Map([
+    ['actions/checkout', '3d3c42e5aac5ba805825da76410c181273ba90b1'],
+    ['actions/upload-artifact', 'cf430e030ddbb5b0abf93d22962f4752f3646cd9'],
+    ['actions/download-artifact', '9000827ccba6bdab643e8b6fd33ac0654aef8333'],
+    ['actions/setup-node', '949feb2413d6458794dcd2491c4babbbce0c15c1'],
+    ['Swatinem/rust-cache', 'd1527c8f67ef9af357290475d4af4b0fab8f12e0'],
+    ['tauri-apps/tauri-action', '1deb371b0cd8bd54025b384f1cd735e725c4060f'],
+  ]);
+  const read = name => yaml.load(fs.readFileSync(path.join(root, '.github/workflows', name), 'utf8'));
+  for (const name of ['upstream-sync.yml', 'validate.yml', 'build.yml', 'actions-smoke.yml']) {
+    for (const job of Object.values(read(name).jobs)) for (const step of job.steps || []) {
+      if (!step.uses) continue;
+      assert.match(step.uses, /@[a-f0-9]{40}$/);
+      const [action, sha] = step.uses.split('@');
+      assert.notEqual(action, 'arduino/setup-protoc');
+      if (pins.has(action)) assert.equal(sha, pins.get(action));
+      if (action === 'actions/setup-node') {
+        assert.equal(step.with['node-version'], '22');
+        assert.equal(step.with['package-manager-cache'], false);
+      }
+      if (action === 'actions/checkout') assert.notEqual(step.with?.['allow-unsafe-pr-checkout'], true);
+    }
+  }
+  const smoke = read('actions-smoke.yml');
+  assert.deepEqual(Object.keys(smoke.on), ['workflow_dispatch']);
+  assert.deepEqual(smoke.permissions, { contents: 'read' });
+  const job = smoke.jobs['artifact-round-trip'];
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.ok(job['timeout-minutes'] <= 10);
+  assert.equal(job.steps.find(s => s.uses?.startsWith('actions/checkout@')).with['persist-credentials'], false);
+  assert.equal(job.steps.find(s => s.uses?.startsWith('actions/upload-artifact@')).with['retention-days'], 1);
+  assert.ok(job.steps.some(s => s.uses?.startsWith('actions/download-artifact@')));
+  assert.ok(job.steps.some(s => s.run?.startsWith('cmp ')));
+  assert.doesNotMatch(JSON.stringify(smoke), /secrets\.|npm |cargo |gh release|git push/);
+  assert.deepEqual(read('ci.yml').jobs.check.strategy.matrix.platform, ['macos-latest', 'ubuntu-22.04', 'windows-latest']);
+});
