@@ -31,6 +31,8 @@ Use only the built-in, job-scoped GitHub token. Keep repository default workflow
 
 Retain reports and candidate bundles for 14 days. Use GitHub Actions failure notifications for conflicts and failed checks; inspect the job summary and `candidate.json`. Expect no draft when nothing changes. GitHub may delay scheduled runs or disable them after prolonged repository inactivity; retain manual dispatch as the recovery path.
 
+Keep JavaScript actions on reviewed Node 24 releases pinned to full commit identifiers. Keep the application build/test runtime on Node 22 and disable implicit npm caching. Use Chocolatey for the existing Windows protoc step rather than retaining the Node 20-only action. Preserve runner labels, token scopes, draft-only releases and candidate execution boundaries. Run **Validate action upgrades** manually to check checkout, Node setup and an exact synthetic artifact upload/download without provider secrets or release publication. Review packaged Tauri changes separately; v1 requires stable Tauri v2 and adds the app version to updater archive names.
+
 ## Accept or defer a candidate
 
 - Review upstream changes by affected subsystem, with particular attention to the retained controls, persistence, raw-source preservation and API surface. Do not audit 154 commits independently when a coherent cumulative diff and targeted tests provide better evidence.
