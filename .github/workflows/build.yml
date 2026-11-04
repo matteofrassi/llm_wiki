@@ -27,8 +27,17 @@ jobs:
       CARGO_HTTP_MULTIPLEXING: "false"
       CARGO_NET_RETRY: "5"
       CARGO_HTTP_TIMEOUT: "60"
+      # An unset secret still becomes an empty variable, and Tauri imports any
+      # APPLE_CERTIFICATE variable, so expose only whether a certificate exists.
+      APPLE_SIGNING_CONFIGURED: ${{ secrets.APPLE_CERTIFICATE != '' }}
 
     steps:
+      - name: Require Apple signing for tagged macOS releases
+        if: github.event_name == 'push' && startsWith(matrix.platform, 'macos-') && env.APPLE_SIGNING_CONFIGURED != 'true'
+        run: |
+          echo "::error::Configure the Apple signing and notarization secrets before building a tagged macOS release."
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -97,6 +106,7 @@ jobs:
           npm run mcp:build
 
       - name: Build Tauri app
+        if: env.APPLE_SIGNING_CONFIGURED == 'true' || !startsWith(matrix.platform, 'macos-')
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -119,6 +129,15 @@ jobs:
           # only after the fork release review and acceptance gates pass.
           releaseDraft: ${{ github.event_name == 'push' }}
           prerelease: false
+          args: ${{ matrix.args }}
+
+      # Without Developer ID credentials, manual runs pass no Apple variables:
+      # Tauri then applies the configured ad-hoc identity ("-") and skips
+      # notarization. These bundles are packaging checks, not release assets.
+      - name: Build ad-hoc macOS test bundle
+        if: github.event_name == 'workflow_dispatch' && startsWith(matrix.platform, 'macos-') && env.APPLE_SIGNING_CONFIGURED != 'true'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        with:
           args: ${{ matrix.args }}
 
       - name: Verify signed macOS app and DMG
