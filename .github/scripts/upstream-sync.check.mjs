@@ -172,3 +172,40 @@ test('pin Node 24 action upgrades and keep the manual artifact check read-only',
   assert.doesNotMatch(JSON.stringify(smoke), /secrets\.|npm |cargo |gh release|git push/);
   assert.deepEqual(read('ci.yml').jobs.check.strategy.matrix.platform, ['macos-latest', 'ubuntu-22.04', 'windows-latest']);
 });
+
+test('build ad-hoc manual macOS bundles without empty Apple signing variables', () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+  const job = yaml.load(fs.readFileSync(path.join(root, '.github/workflows/build.yml'), 'utf8')).jobs.build;
+  const step = name => {
+    const found = job.steps.find(s => s.name === name);
+    assert.ok(found, `missing step: ${name}`);
+    return found;
+  };
+  const position = name => job.steps.indexOf(step(name));
+  const mac = "startsWith(matrix.platform, 'macos-')";
+  // An unset secret still becomes an empty variable, and Tauri imports any APPLE_CERTIFICATE variable.
+  assert.equal(job.env.APPLE_SIGNING_CONFIGURED, "${{ secrets.APPLE_CERTIFICATE != '' }}");
+
+  const guard = step('Require Apple signing for tagged macOS releases');
+  assert.equal(guard.if, `github.event_name == 'push' && ${mac} && env.APPLE_SIGNING_CONFIGURED != 'true'`);
+  assert.match(guard.run, /exit 1/);
+  assert.ok(position('Require Apple signing for tagged macOS releases') < position('Install Rust stable'));
+
+  const signed = step('Build Tauri app');
+  assert.equal(signed.if, `env.APPLE_SIGNING_CONFIGURED == 'true' || !${mac}`);
+  for (const name of ['APPLE_CERTIFICATE', 'APPLE_CERTIFICATE_PASSWORD', 'APPLE_SIGNING_IDENTITY', 'APPLE_ID', 'APPLE_PASSWORD', 'APPLE_TEAM_ID']) {
+    assert.equal(signed.env[name], `\${{ secrets.${name} }}`);
+  }
+
+  const adHoc = step('Build ad-hoc macOS test bundle');
+  assert.equal(adHoc.if, `github.event_name == 'workflow_dispatch' && ${mac} && env.APPLE_SIGNING_CONFIGURED != 'true'`);
+  assert.equal(adHoc.uses, signed.uses);
+  assert.equal(adHoc.env, undefined);
+  assert.deepEqual(adHoc.with, { args: '${{ matrix.args }}' });
+  assert.doesNotMatch(JSON.stringify(adHoc), /secrets\.|GITHUB_TOKEN/);
+  assert.ok(position('Build ad-hoc macOS test bundle') < position('Upload bundles as workflow artifacts (manual runs only)'));
+
+  const config = JSON.parse(fs.readFileSync(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8'));
+  assert.equal(config.bundle.macOS.signingIdentity, '-');
+  assert.equal(step('Verify signed macOS app and DMG').if, `github.event_name == 'push' && ${mac}`);
+});

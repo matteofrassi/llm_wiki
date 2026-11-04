@@ -33,6 +33,8 @@ Retain reports and candidate bundles for 14 days. Use GitHub Actions failure not
 
 Keep JavaScript actions on reviewed Node 24 releases pinned to full commit identifiers. Keep the application build/test runtime on Node 22 and disable implicit npm caching. Use Chocolatey for the existing Windows protoc step rather than retaining the Node 20-only action. Preserve runner labels, token scopes, draft-only releases and candidate execution boundaries. Run **Validate action upgrades** manually to check checkout, Node setup and an exact synthetic artifact upload/download without provider secrets or release publication. Review packaged Tauri changes separately; v1 requires stable Tauri v2 and adds the app version to updater archive names.
 
+Pass Apple signing variables to Tauri only when `APPLE_CERTIFICATE` is configured: an unset secret still creates an empty variable, which Tauri treats as a certificate to import. Without that certificate, manual **Build & Release** runs omit every Apple variable and use the configured ad-hoc identity to produce short-lived packaging-check artifacts, never release assets. Tag builds stop before compiling until Developer ID signing and notarization secrets are configured, then keep the strict signature, Gatekeeper and stapling verification.
+
 ## Accept or defer a candidate
 
 - Review upstream changes by affected subsystem, with particular attention to the retained controls, persistence, raw-source preservation and API surface. Do not audit 154 commits independently when a coherent cumulative diff and targeted tests provide better evidence.
