@@ -189,7 +189,7 @@ test('build ad-hoc manual macOS bundles without empty Apple signing variables', 
   const guard = step('Require Apple signing for tagged macOS releases');
   assert.equal(guard.if, `github.event_name == 'push' && ${mac} && env.APPLE_SIGNING_CONFIGURED != 'true'`);
   assert.match(guard.run, /exit 1/);
-  assert.ok(position('Require Apple signing for tagged macOS releases') < position('Install Rust stable'));
+  assert.equal(position('Require Apple signing for tagged macOS releases'), 0);
 
   const signed = step('Build Tauri app');
   assert.equal(signed.if, `env.APPLE_SIGNING_CONFIGURED == 'true' || !${mac}`);
